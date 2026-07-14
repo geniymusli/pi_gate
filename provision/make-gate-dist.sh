@@ -21,6 +21,11 @@ rm -rf "$DIST"; mkdir -p "$DIST/bin" "$DIST/share" "$DIST/extra"
 
 cp_req(){ [ -f "$1" ] || { echo "НЕТ файла: $1" >&2; exit 1; }; install -m "${3:-755}" "$1" "$2"; }
 
+# xray-бинарники не в git — дотягиваем по пину/SHA, если их нет (после свежего клона).
+if [ ! -f "$PROV/vendor/xray/xray-linux-amd64" ] || [ ! -f "$PROV/vendor/xray/xray-linux-arm64" ]; then
+  echo "→ бинарников xray нет — тяну fetch-xray.sh…"; "$PROV/fetch-xray.sh"
+fi
+
 # bin/ — утилиты (часть _build, часть provision)
 for f in gate gate-monitor gate-snapshot gate-tproxy-up.sh gate-tproxy-down.sh gate-web.py; do
   cp_req "$BUILD/$f" "$DIST/bin/$f"
