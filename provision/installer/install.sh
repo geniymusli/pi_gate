@@ -300,6 +300,17 @@ systemctl enable --now dnsmasq        >/dev/null 2>&1 || warn "dnsmasq не ст
 systemctl restart NetworkManager      >/dev/null 2>&1 || true
 ok "hostapd / dnsmasq / dnscrypt-proxy включены"
 
+# 9) заморозка риск-пакетов: apt upgrade не должен внезапно менять ядро/Wi-Fi-драйвер/
+#    firmware/iptables и ломать роутер. Ставим hold на текущих (только что установленных)
+#    версиях. Полный пин: gate freeze all. Разморозить: gate unfreeze.
+say "${B}→ Замораживаю риск-пакеты (ядро/firmware/сеть/iptables)…${N}"
+_held=0
+for p in raspberrypi-kernel raspberrypi-bootloader linux-image-rpi-v8 linux-image-rpi-2712 \
+         firmware-brcm80211 raspi-firmware iptables hostapd dnsmasq dnscrypt-proxy wpasupplicant network-manager; do
+  dpkg-query -W "$p" >/dev/null 2>&1 && apt-mark hold "$p" >/dev/null 2>&1 && _held=$((_held+1))
+done
+ok "заморожено риск-пакетов: $_held  (gate freeze all — заморозить всё; gate unfreeze — снять)"
+
 # финал
 echo
 say "${G}${B}Базовая установка завершена.${N}"

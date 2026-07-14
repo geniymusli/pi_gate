@@ -568,6 +568,73 @@ cmd_tunnel(){
   esac
 }
 
+# ─── Команда: doctor ─ проверка+починка (после apt upgrade / ребута) ──
+# `gate doctor`       — проверить И переприменить (службы + tproxy идемпотентно)
+# `gate doctor check` — только проверить, ничего не трогать
+cmd_doctor(){
+  local fix=1; [ "${1:-}" = check ] && fix=0
+  printf "\n%s┌─ gate doctor ─────────────────────────────────%s\n" "$CYA" "$R"
+  # 1) бэкенд iptables — критично для tproxy (смена nft↔legacy ломает перехват)
+  local be; be="$(sudo iptables --version 2>/dev/null | grep -oE 'nf_tables|legacy' || echo '?')"
+  printf "%s│%s iptables: %s %s\n" "$CYA" "$R" "$be" "$([ "$be" = nf_tables ] && ok || bad)"
+  # 2) интерфейсы
+  printf "%s│%s AP %s:  %s\n" "$CYA" "$R" "$AP_IFACE" "$([ "$(cat /sys/class/net/$AP_IFACE/operstate 2>/dev/null)" = up ] && ok || bad)"
+  printf "%s│%s WAN route: %s\n" "$CYA" "$R" "$([ -n "$(default_dev)" ] && ok || bad)"
+  # 3) службы — при fix поднимаем упавшие
+  local s
+  for s in dnscrypt-proxy hostapd dnsmasq "$XRAY_SVC"; do
+    if svc_active "$s"; then printf "%s│%s svc %-14s %s\n" "$CYA" "$R" "$s:" "$(ok)"
+    else
+      printf "%s│%s svc %-14s %s" "$CYA" "$R" "$s:" "$(bad)"
+      [ "$fix" = 1 ] && { sudo systemctl start "$s" >/dev/null 2>&1 && printf " → поднял" || printf " → не поднялся"; }
+      printf "\n"
+    fi
+  done
+  # 4) tproxy — при fix переприменяем (гарантирует правила под текущий backend/интерфейсы)
+  if [ "$fix" = 1 ] && svc_active "$XRAY_SVC"; then
+    printf "%s│%s tproxy: переприменяю…\n" "$CYA" "$R"; sudo bash "$TPROXY_UP" >/dev/null 2>&1 || true
+  fi
+  printf "%s│%s tproxy: %s\n" "$CYA" "$R" "$(tproxy_active && ok || bad)"
+  # 5) выход в интернет
+  printf "%s│%s наружу: %s\n" "$CYA" "$R" "$(curl -s --max-time 6 -o /dev/null "$EXIT_CHECK_URL" 2>/dev/null && ok || bad)"
+  printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+  if [ "$fix" = 1 ]; then echo "Если «наружу» — down: gate tunnel restart, при апдейте ядра — reboot."; fi
+  return 0
+}
+
+# ─── Команды: freeze / unfreeze ─ пин версий пакетов (apt-mark hold) ──
+# Аппаратный принцип: обновил один раз → проверил (gate doctor) → заморозил.
+# Дальше apt upgrade ничего не двигает, пока сам не разморозишь.
+RISK_PKGS="raspberrypi-kernel raspberrypi-bootloader linux-image-rpi-v8 linux-image-rpi-2712 firmware-brcm80211 raspi-firmware iptables hostapd dnsmasq dnscrypt-proxy wpasupplicant network-manager"
+cmd_freeze(){
+  case "${1:-all}" in
+    all)
+      local n; n=$(dpkg-query -Wf '${Package}\n' 2>/dev/null | wc -l)
+      echo "→ Замораживаю ВСЕ пакеты ($n) на текущих версиях…"
+      dpkg-query -Wf '${Package}\n' 2>/dev/null | xargs -r sudo apt-mark hold >/dev/null
+      echo "  ✓ заморожено. apt upgrade теперь ничего не поднимет. Разморозить: gate unfreeze"
+      ;;
+    risk)
+      echo "→ Замораживаю риск-пакеты (ядро/firmware/сеть/iptables)…"
+      local p held=0
+      for p in $RISK_PKGS; do dpkg-query -W "$p" >/dev/null 2>&1 && sudo apt-mark hold "$p" >/dev/null 2>&1 && held=$((held+1)); done
+      echo "  ✓ заморожено риск-пакетов: $held (разморозить: gate unfreeze)"
+      ;;
+    status)
+      local h; h="$(apt-mark showhold 2>/dev/null)"
+      [ -n "$h" ] && { echo "Заморожено ($(printf '%s\n' "$h" | wc -l)):"; printf '%s\n' "$h" | sed 's/^/  /'; } || echo "Ничего не заморожено."
+      ;;
+    *) echo "gate freeze {all|risk|status}  •  gate unfreeze" ;;
+  esac
+}
+cmd_unfreeze(){
+  local h; h="$(apt-mark showhold 2>/dev/null)"
+  [ -z "$h" ] && { echo "Заморозок нет."; return 0; }
+  echo "→ Размораживаю $(printf '%s\n' "$h" | wc -l) пакетов…"
+  printf '%s\n' "$h" | xargs -r sudo apt-mark unhold >/dev/null
+  echo "  ✓ разморожено."
+}
+
 # ─── Команда: socks (финальный хоп через покупной SOCKS5) ─────────────
 # Носок надевается на С2 (дозвон от С2, прокси видит IP С2, не тебя).
 # Управление с малины через SSH-цепочку малина→С1→С2 (С2 видит только С1).
@@ -1763,6 +1830,8 @@ ${hr}━━ ВЕБ-ПАНЕЛЬ (управление из локалки) ━�
 ${hr}━━ ТУННЕЛЬ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
   ${g}gate tunnel up|down|restart${R}  поднять / опустить / пересобрать
   ${g}gate tunnel status${R}           состояние перехвата
+  ${g}gate doctor${R}                  проверка+починка (после apt upgrade / ребута)
+  ${g}gate freeze [all|risk]${R}       пин версий пакетов (apt-mark hold); ${g}gate unfreeze${R} снять
 
 ${hr}━━ ЦЕПОЧКА (C1/C2/C3) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
   ${g}gate setup${R}                   визард: развернуть/пересобрать
@@ -1815,6 +1884,9 @@ case "${1:-help}" in
   clients) cmd_clients ;;
   traffic) shift; cmd_traffic "$@" ;;
   tunnel) shift; cmd_tunnel "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  freeze) shift; cmd_freeze "$@" ;;
+  unfreeze) cmd_unfreeze ;;
   socks) shift; cmd_socks "$@" ;;
   ovpn)  shift; cmd_ovpn "$@" ;;
   pptp)  shift; cmd_pptp "$@" ;;
