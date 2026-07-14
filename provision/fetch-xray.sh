@@ -43,6 +43,24 @@ fetch_one(){
   echo "  ✓ $arch готов (SHA сверен с MANIFEST и релизом XTLS)"
 }
 
+# Исходник тегированного релиза (для аудита/страховки; лежит в git, ~868КБ).
+# fetch нужен при БАМПЕ версии — подтянуть новый исходник к новому пину.
+fetch_src(){
+  local out="$DIR/xray-src-$VER.tar.gz"
+  local sha; sha="$(man_sha "xray-src-$VER.tar.gz")"
+  [ -n "$sha" ] || { echo "  (исходник для $VER не пиннован в MANIFEST — пропускаю)"; return 0; }
+  if [ -f "$out" ] && echo "$sha  $out" | sha256sum -c --status; then
+    echo "  ✓ исходник уже на месте (SHA ок)"; return 0
+  fi
+  echo "  → качаю исходник xray $VER…"
+  local tmp; tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/src.tgz" "https://github.com/XTLS/Xray-core/archive/refs/tags/v${VER}.tar.gz"
+  echo "$sha  $tmp/src.tgz" | sha256sum -c --status || { echo "✗ исходник SHA не совпал!" >&2; rm -rf "$tmp"; exit 1; }
+  install -m 644 "$tmp/src.tgz" "$out"; rm -rf "$tmp"
+  echo "  ✓ исходник готов (SHA сверен)"
+}
+
 echo "fetch-xray: версия $VER → $DIR"
 for a in amd64 arm64; do fetch_one "$a"; done
+fetch_src
 echo "готово."
