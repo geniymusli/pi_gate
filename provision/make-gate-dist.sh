@@ -70,14 +70,28 @@ sha256sum share/xray-linux-amd64       # сверь с MANIFEST и с релиз
 sha256sum -c SHA256SUMS  # целостность всех файлов раздачи
 \`\`\`
 
-## Установка (чистый Raspberry Pi OS Lite 64)
+## Установка (чистый Raspberry Pi OS Lite 64-bit)
 \`\`\`
+# 0) обновить систему ОДИН раз до актуальной (потом установщик её заморозит)
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+
+# 1) закинуть этот архив на малину (scp / флешка), распаковать и поставить
+tar xzf gate-$VER.tar.gz && cd gate-$VER
 sudo ./install.sh          # спросит интерфейсы (раздача/интернет), SSID, пароль
-sudo reboot
-gate setup                 # своя цепочка серверов и ключи (генерятся у тебя, никому не уходят)
-gate web passwd && gate web on
+sudo reboot                # чтобы AP и сеть встали чисто
+
+# 2) своя цепочка серверов и ключи (генерятся у тебя, никому не уходят)
+gate setup
+gate web passwd && gate web on     # веб-панель: http://gate:8088
+
+# 3) проверить, что всё живо
+gate doctor
 \`\`\`
-Обновление позже: \`sudo ./install.sh --update\` (обновит только скрипты, конфиги сохранит).
+Установщик в конце **замораживает** ядро/firmware/сеть (\`apt-mark hold\`), чтобы будущий
+\`apt upgrade\` не сломал роутер. Полный пин: \`gate freeze all\`. Снять: \`gate unfreeze\`.
+После любого \`apt upgrade\`/ребута — \`gate doctor\` (проверит и переприменит правила).
+
+Обновление gate позже: \`sudo ./install.sh --update\` (обновит только скрипты, конфиги сохранит).
 
 ## Что установщик меняет в системе
 - ставит apt-пакеты: hostapd, dnsmasq, dnscrypt-proxy, iptables, iw, curl;
