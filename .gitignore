@@ -1,0 +1,28 @@
+# ── Секреты (вынесены физически в ~/pi_gate_private/; здесь — второй рубеж) ──
+# Реальные конфиги/ключи цепочки. Пример — chain.example.json (в git).
+provision/chain.json
+_build/pi-config.json
+_build/c1-config.json
+
+# Снапшоты (внутри SSH-ключи, chain.json) и распакованное
+snapshots/
+_extracted/
+gate-snapshot
+s1-snapshot
+*-snapshot-*.tar.gz
+
+# ── xray-бинарники (тянутся по SHA через provision/fetch-xray.sh, не в git) ──
+provision/vendor/xray/xray-linux-amd64
+provision/vendor/xray/xray-linux-arm64
+
+# ── Сборочный вывод ──
+dist/
+*.deb
+
+# ── Мусор ──
+__pycache__/
+*.pyc
+*.tmp
+
+# Локальные настройки Claude Code (личное, не в общий репо)
+.claude/settings.local.json

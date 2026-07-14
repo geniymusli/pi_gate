@@ -1,0 +1,1833 @@
+#!/usr/bin/env bash
+#
+# gate — панель управления privacy-роутером (Raspberry Pi)
+# Управляет источником WAN (Ethernet / встроенный Wi-Fi), AP и показывает статус.
+# Статус туннеля (WG/VLESS/padding) дописывается по мере настройки этих компонентов.
+#
+set -uo pipefail
+GATE_VERSION="0.1"
+
+# ─── Конфиг ───────────────────────────────────────────────────────────
+# Переопредели в /etc/gate/gate.conf при необходимости.
+WAN_ETH="eth0"        # Ethernet от провайдера
+WAN_WIFI="wlan0"      # встроенный Wi-Fi (клиент к чужой сети)
+AP_IFACE="wlan1"      # USB Wi-Fi адаптер (раздача, всегда AP)
+WG_IFACE="wg0"        # WireGuard интерфейс
+XRAY_SVC="xray"       # имя systemd-сервиса xray
+PADDING_SVC="gate-padding"  # имя systemd-сервиса padding
+EXIT_CHECK_URL="https://api.ipify.org"  # проверка выходного IP
+DHCP_LEASES="/var/lib/misc/dnsmasq.leases"  # файл аренд dnsmasq
+
+# ─── Параметры туннеля (TPROXY data plane, WG убран) ──────────────────
+AP_SUBNET="192.168.50.0/24"  # подсеть AP (твои устройства)
+TPROXY_PORT="12345"          # дефолт-фолбэк; реальный порт берётся из chain.json (см. ниже)
+SOCKS_TEST="127.0.0.1:10808" # дефолт-фолбэк; порт из chain.json socks_test_port (см. ниже)
+TPROXY_UP="/usr/local/bin/gate-tproxy-up.sh"
+TPROXY_DOWN="/usr/local/bin/gate-tproxy-down.sh"
+
+# ─── Цепочка и управление (источник правды: chain.json) ───────────────
+# Модель управления — ПРЯМАЯ сетка: ключ малины (mgmt_key из chain.json) добавлен
+# в root@authorized_keys на КАЖДОМ хопе, малина дотягивается до любого напрямую.
+# Цепочку разворачивает/правит визард: gate setup.
+CHAIN_JSON="/etc/gate/chain.json"
+RENDER="/usr/local/bin/chain-render.py"  # рендерер конфигов и SSH-цепочки
+MGMT_KEY="${HOME:-/home/pi}/.ssh/gate_to_s1"    # дефолт; реальный берётся из chain.json
+EXIT_XRAY_CONF="/usr/local/etc/xray/config.json"  # путь конфига xray на выходном хопе
+PI_XRAY_CONF="/usr/local/etc/xray/config.json"    # конфиг xray самой малины
+SOCKS_CONF="/etc/gate/socks.conf"        # параметры носка (хранятся на малине)
+SOCKS_STATE="/etc/gate/socks.state"      # on/off — режим носка (читает chain-render)
+SOCKS_CAPS="/etc/gate/socks.caps"        # TCP/RDNS/UDP=ok|fail — возможности носка
+VPN_STATE="/etc/gate/vpn.state"          # on/off — режим VPN-выхода (читает chain-render)
+VPN_META="/etc/gate/vpn.conf"            # TYPE=ovpn|pptp
+C2_VPN_DIR="/etc/gate/vpn"               # каталог конфигов VPN НА выходном хопе
+PROFILE_DIR="/etc/gate/profiles"         # именованные профили носков/VPN (на малине, root-only)
+VPN_SCRIPT="/usr/local/share/gate/gate-vpn"  # C2-side скрипт (стейджится на малине)
+DNS_FALLBACK_STATE="/etc/gate/dns-fallback.state"  # on/off — запасной DNS, если туннель свой не дал
+DNS_FALLBACK_SERVERS="1.1.1.1 8.8.8.8"   # по явному запросу: Cloudflare+Google «в крайнем случае»
+DNSCRYPT_TOML="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"  # резолвер малины (прямой выход)
+OSFP_SCRIPT="/usr/local/share/gate/gate-osfp"      # C2-side контроллер OS-спуфа (стейджится на малине)
+OSFP_PY="/usr/local/share/gate/gate-osfp.py"       # C2-side хендлер NFQUEUE (стейджится на малине)
+
+# Порты — единый источник правды chain.json (пишется при gate setup). Дефолты выше = фолбэк
+# на случай отсутствия chain.json (свежая малина). Совпадают с тем, что рендерит chain-render.py.
+if [ -f "$CHAIN_JSON" ]; then
+  eval "$(python3 - "$CHAIN_JSON" <<'PY' 2>/dev/null
+import json,sys
+try: c=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+tp=c.get("tproxy_port"); st=c.get("socks_test_port")
+if tp: print('TPROXY_PORT="%s"' % tp)
+if st: print('SOCKS_TEST="127.0.0.1:%s"' % st)
+PY
+)"
+fi
+
+# ─── Логирование ──────────────────────────────────────────────────────
+LOG_CONF="/etc/gate/log.conf"            # флаги логирования (TRAFFIC=, PERF=)
+XRAY_ACCESS="/var/log/xray/access.log"   # лог соединений малины (traffic)
+PERF_LOG="/var/log/gate-monitor.log"     # лог производительности (perf)
+PERF_SVC="gate-monitor"                  # systemd-сервис perf-мониторинга
+
+[ -f /etc/gate/gate.conf ] && . /etc/gate/gate.conf
+
+# ─── Цвета ────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'
+  GRN=$'\e[32m'; RED=$'\e[31m'; YEL=$'\e[33m'; CYA=$'\e[36m'; GRY=$'\e[90m'
+else
+  B=""; D=""; R=""; GRN=""; RED=""; YEL=""; CYA=""; GRY=""
+fi
+
+ok(){ printf "%sok%s"   "$GRN" "$R"; }
+no(){ printf "%s—%s"    "$GRY" "$R"; }
+bad(){ printf "%sdown%s" "$RED" "$R"; }
+
+# ─── Хелперы ──────────────────────────────────────────────────────────
+iface_ip(){ ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | head -n1; }
+iface_up(){ [ "$(cat /sys/class/net/$1/operstate 2>/dev/null)" = "up" ]; }
+has_carrier(){ [ "$(cat /sys/class/net/$1/carrier 2>/dev/null)" = "1" ]; }
+svc_active(){ systemctl is-active --quiet "$1" 2>/dev/null; }
+default_dev(){ ip route show default 2>/dev/null | awk '{print $5; exit}'; }
+# выходной IP цепочки (через socks-test → reality-s1 → C1 → C2).
+# В tproxy-режиме свой трафик малины НЕ перехватывается, поэтому проверяем
+# выход через локальный socks, а не через --interface.
+tunnel_exit_ip(){ curl -s --max-time "${1:-8}" --socks5-hostname "$SOCKS_TEST" "$EXIT_CHECK_URL" 2>/dev/null; }
+# tproxy поднят, если есть и ip rule (fwmark 1 → table 100), и цепочка GATE_TP
+tproxy_active(){
+  ip -4 rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100' && \
+  sudo iptables -t mangle -S GATE_TP >/dev/null 2>&1
+}
+
+# ─── Цепочка: чтение chain.json и прямое управление выходным хопом ─────
+chain_ready(){ [ -f "$CHAIN_JSON" ]; }
+chain_get(){ python3 -c "import json;c=json.load(open('$CHAIN_JSON'));print($1)" 2>/dev/null; }
+mgmt_key(){ local k; k="$(chain_get "c.get('mgmt_key','')")"; [ -n "$k" ] && echo "$k" || echo "$MGMT_KEY"; }
+exit_host(){ chain_get "c['hops'][-1]['host']"; }
+exit_name(){ chain_get "c['hops'][-1].get('name','exit')"; }
+
+# мгновенная скорость на интерфейсе (мбит/с, по rx/tx за 1с)
+iface_rate(){
+  local i="$1" rx1 tx1 rx2 tx2
+  rx1=$(cat /sys/class/net/$i/statistics/rx_bytes 2>/dev/null || echo 0)
+  tx1=$(cat /sys/class/net/$i/statistics/tx_bytes 2>/dev/null || echo 0)
+  sleep 1
+  rx2=$(cat /sys/class/net/$i/statistics/rx_bytes 2>/dev/null || echo 0)
+  tx2=$(cat /sys/class/net/$i/statistics/tx_bytes 2>/dev/null || echo 0)
+  awk -v a=$rx1 -v b=$rx2 -v c=$tx1 -v d=$tx2 \
+    'BEGIN{printf "↓%.1f ↑%.1f мбит/с", (b-a)*8/1e6, (d-c)*8/1e6}'
+}
+
+# ─── Команда: info ────────────────────────────────────────────────────
+cmd_info(){
+  local wan_dev; wan_dev=$(default_dev)
+  local sec="${CYA}${B}" hr="${CYA}├───────────────────────────────────────────────${R}"
+
+  printf "\n${CYA}┌─ ${B}gate${R}${CYA} · privacy-роутер ────────────────────────${R}\n"
+
+  # ── ПОДКЛЮЧЕНИЕ ──
+  printf "${CYA}│${R} ${sec}ПОДКЛЮЧЕНИЕ${R}\n"
+  if [ "$wan_dev" = "$WAN_ETH" ]; then
+    printf "${CYA}│${R}   ${D}WAN${R}      Ethernet (%s)  %s\n" "$WAN_ETH" "$(iface_ip $WAN_ETH)"
+    printf "${CYA}│${R}   ${D}MAC${R}      %s\n" "$(cat /sys/class/net/$WAN_ETH/address 2>/dev/null)"
+  elif [ -n "$WAN_WIFI" ] && [ "$wan_dev" = "$WAN_WIFI" ]; then
+    local ssid; ssid=$(iw dev $WAN_WIFI link 2>/dev/null | awk -F': ' '/SSID/{print $2}')
+    printf "${CYA}│${R}   ${D}WAN${R}      Wi-Fi «%s» (%s)  %s\n" "${ssid:-?}" "$WAN_WIFI" "$(iface_ip $WAN_WIFI)"
+    printf "${CYA}│${R}   ${D}MAC${R}      %s\n" "$(cat /sys/class/net/$WAN_WIFI/address 2>/dev/null)"
+  else
+    printf "${CYA}│${R}   ${D}WAN${R}      %s нет маршрута\n" "$(no)"
+  fi
+  printf "${CYA}│${R}   ${D}наружу${R}   "
+  curl -s --max-time 6 -o /dev/null "$EXIT_CHECK_URL" 2>/dev/null && printf "%s\n" "$(ok)" || printf "%s\n" "$(bad)"
+
+  printf "%s\n" "$hr"
+  # ── РАЗДАЧА ──
+  printf "${CYA}│${R} ${sec}РАЗДАЧА${R}\n"
+  printf "${CYA}│${R}   ${D}AP${R}       "
+  if svc_active hostapd; then
+    local apssid apch
+    apssid=$(awk -F= '/^ssid=/{print $2}' /etc/hostapd/hostapd.conf 2>/dev/null)
+    apch=$(awk -F= '/^channel=/{print $2}' /etc/hostapd/hostapd.conf 2>/dev/null)
+    printf "%s  «%s» ch%s (%s)\n" "$(ok)" "${apssid:-?}" "${apch:-?}" "$AP_IFACE"
+    printf "${CYA}│${R}   ${D}MAC${R}      %s\n" "$(cat /sys/class/net/$AP_IFACE/address 2>/dev/null)"
+  else
+    printf "%s раздача выключена\n" "$(bad)"
+  fi
+  printf "${CYA}│${R}   ${D}клиенты${R}  "
+  local clients; clients=$(iw dev $AP_IFACE station dump 2>/dev/null | grep -c "^Station")
+  [ "${clients:-0}" -gt 0 ] && printf "%s%s подключено%s\n" "$GRN" "$clients" "$R" || printf "%sнет%s\n" "$GRY" "$R"
+
+  printf "%s\n" "$hr"
+  # ── ТУННЕЛЬ ──
+  printf "${CYA}│${R} ${sec}ТУННЕЛЬ${R}\n"
+  printf "${CYA}│${R}   ${D}tproxy${R}   "
+  tproxy_active && printf "%s → :%s → Reality\n" "$(ok)" "$TPROXY_PORT" || printf "%s опущен (fail-closed)\n" "$(bad)"
+  printf "${CYA}│${R}   ${D}xray${R}     "
+  svc_active "$XRAY_SVC" && printf "%s\n" "$(ok)" || printf "%s не запущен\n" "$(no)"
+  printf "${CYA}│${R}   ${D}padding${R}  "
+  svc_active "$PADDING_SVC" && printf "%s constant-rate\n" "$(ok)" || printf "%s выключен\n" "$(no)"
+  printf "${CYA}│${R}   ${D}выход${R}    %s%s%s\n" "$GRN" "$(exit_label "$(active_exit)")" "$R"
+
+  printf "%s\n" "$hr"
+  # ── Exit IP ──
+  local exit_ip; exit_ip=$(tunnel_exit_ip 6)
+  printf "${CYA}│${R}   ${D}Exit IP${R}  %s%s%s ${D}(куда смотрит наблюдатель)${R}\n" "$YEL" "${exit_ip:-не определён}" "$R"
+  printf "${CYA}└───────────────────────────────────────────────${R}\n"
+  printf "  ${D}живой трафик:${R} ${GRN}gate traffic${R}\n\n"
+}
+
+# ─── Команда: traffic ─ живой монитор скорости (до Ctrl+C) ────────────
+_rxb(){ cat "/sys/class/net/$1/statistics/rx_bytes" 2>/dev/null || echo 0; }
+_txb(){ cat "/sys/class/net/$1/statistics/tx_bytes" 2>/dev/null || echo 0; }
+cmd_traffic(){
+  local dev="${1:-$(default_dev)}"
+  [ -n "$dev" ] && [ -d "/sys/class/net/$dev" ] || { echo "Нет интерфейса «$dev». Использование: gate traffic [iface]"; exit 1; }
+  trap 'printf "\n"; exit 0' INT
+  printf "${CYA}Живой трафик${R} на ${B}%s${R}  ${D}— Ctrl+C для выхода${R}\n" "$dev"
+  local rx0 tx0 rx1 tx1 rx2 tx2 down up pd=0 pu=0
+  rx0=$(_rxb "$dev"); tx0=$(_txb "$dev"); rx1=$rx0; tx1=$tx0
+  while true; do
+    sleep 1
+    rx2=$(_rxb "$dev"); tx2=$(_txb "$dev")
+    down=$(awk -v a="$rx1" -v b="$rx2" 'BEGIN{printf "%.1f",(b-a)*8/1e6}')
+    up=$(awk   -v a="$tx1" -v b="$tx2" 'BEGIN{printf "%.1f",(b-a)*8/1e6}')
+    pd=$(awk -v p="$pd" -v c="$down" 'BEGIN{print (c>p)?c:p}')
+    pu=$(awk -v p="$pu" -v c="$up"   'BEGIN{print (c>p)?c:p}')
+    local td tu; td=$(awk -v a="$rx0" -v b="$rx2" 'BEGIN{printf "%.1f",(b-a)/1048576}')
+    tu=$(awk -v a="$tx0" -v b="$tx2" 'BEGIN{printf "%.1f",(b-a)/1048576}')
+    printf "\r\033[K  ${GRN}↓%7s${R} ${YEL}↑%7s${R} ${D}Мбит/с${R}   ${D}пик${R} ↓%s ↑%s   ${D}сессия${R} ↓%sМБ ↑%sМБ" \
+      "$down" "$up" "$pd" "$pu" "$td" "$tu"
+    rx1=$rx2; tx1=$tx2
+  done
+}
+
+# ─── Команда: wan ─────────────────────────────────────────────────────
+# Есть ли ОТДЕЛЬНЫЙ радиомодуль под WAN-Wi-Fi (не тот, что раздаёт)? Если под
+# раздачу отдан встроенный wlan0 (нет USB-свистка), WAN_WIFI пуст (или = AP) —
+# свободного радио нет, WAN только по кабелю. Тогда gate wan wifi / gate wifi
+# вежливо отказывают, а gate wan auto никогда не сваливается в wifi.
+wifi_wan_available(){ [ -n "$WAN_WIFI" ] && [ "$WAN_WIFI" != "$AP_IFACE" ]; }
+no_wifi_wan_msg(){
+  echo "Встроенный Wi-Fi отдан под раздачу (AP=$AP_IFACE) — отдельного радиомодуля"
+  echo "под WAN-Wi-Fi нет. Интернет принимается только по кабелю: gate wan eth."
+  echo "Нужен wifi-WAN — воткни USB-Wi-Fi адаптер и переустанови (он станет AP, wlan0 освободится)."
+}
+
+# Выключить встроенный Wi-Fi (wlan0): снять автоконнект со ВСЕХ Wi-Fi-клиент-
+# соединений (wlan1=AP вне NM не трогается) и отключить устройство. Иначе NM
+# снова поднимет wlan0 → второй default-маршрут → чехарда и обрывы.
+wifi_disable(){
+  wifi_wan_available || return 0   # нет отдельного Wi-Fi под WAN — нечего выключать
+  nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 ~ /wireless/{print $1}' | while read -r c; do
+    sudo nmcli connection modify "$c" connection.autoconnect no 2>/dev/null
+  done
+  sudo nmcli device disconnect "$WAN_WIFI" >/dev/null 2>&1
+}
+
+# ─── Команда: wan ─ только выбор «какой интерфейс является WAN» ─────────
+cmd_wan(){
+  local sub="${1:-show}"
+  case "$sub" in
+    eth)
+      echo "→ WAN ← Ethernet ($WAN_ETH); встроенный Wi-Fi выключаю полностью…"
+      wifi_disable
+      sudo nmcli device connect "$WAN_ETH" >/dev/null 2>&1
+      sleep 2; cmd_wan show
+      ;;
+    wifi)
+      wifi_wan_available || { no_wifi_wan_msg; exit 1; }
+      # Сделать WAN = wlan0 по УЖЕ сохранённой сети (подключиться к новой: gate wifi connect).
+      echo "→ WAN ← встроенный Wi-Fi ($WAN_WIFI)…"
+      sudo nmcli device connect "$WAN_WIFI" >/dev/null 2>&1
+      sleep 2
+      local con; con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$WAN_WIFI" '$2==d{print $1; exit}')
+      if [ -n "$con" ]; then
+        sudo nmcli connection modify "$con" connection.autoconnect yes 2>/dev/null
+      else
+        echo "  (нет сохранённой сети на $WAN_WIFI — подключись: gate wifi connect \"SSID\" пароль)"
+      fi
+      cmd_wan show
+      ;;
+    auto)
+      if has_carrier "$WAN_ETH"; then
+        echo "→ Кабель есть → Ethernet"; cmd_wan eth
+      elif wifi_wan_available; then
+        echo "→ Кабеля нет → встроенный Wi-Fi"; cmd_wan wifi
+      else
+        echo "→ Кабеля нет, а wifi-WAN недоступен (одна радиокарта) → остаюсь на Ethernet ($WAN_ETH)"
+        cmd_wan eth
+      fi
+      ;;
+    show|"")
+      local dev; dev=$(default_dev)
+      printf "Текущий WAN: "
+      case "$dev" in
+        "$WAN_ETH")  printf "%sEthernet%s (%s) %s\n" "$GRN" "$R" "$WAN_ETH" "$(iface_ip $WAN_ETH)";;
+        "$WAN_WIFI") printf "%sWi-Fi%s (%s) %s\n"     "$GRN" "$R" "$WAN_WIFI" "$(iface_ip $WAN_WIFI)";;
+        *)           printf "%sне определён%s\n" "$RED" "$R";;
+      esac
+      ;;
+    *) echo "gate wan {eth|wifi|auto|show}";;
+  esac
+}
+
+# ─── Команда: wifi ─ всё про встроенный Wi-Fi-клиент (wlan0) ───────────
+cmd_wifi(){
+  local sub="${1:-show}"
+  wifi_wan_available || { no_wifi_wan_msg; exit 1; }
+  case "$sub" in
+    connect)
+      local ssid="${2:-}" pass="${3:-}"
+      if [ -z "$ssid" ]; then echo "Использование: gate wifi connect \"SSID\" [пароль]"; exit 1; fi
+      echo "→ Подключаю встроенный Wi-Fi ($WAN_WIFI) к «$ssid» (станет WAN)…"
+      if [ -n "$pass" ]; then
+        sudo nmcli device wifi connect "$ssid" password "$pass" ifname "$WAN_WIFI"
+      else
+        sudo nmcli device wifi connect "$ssid" ifname "$WAN_WIFI"
+      fi
+      # включить автоконнект активного соединения wlan0 (для переездов)
+      local con; con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$WAN_WIFI" '$2==d{print $1; exit}')
+      [ -n "$con" ] && sudo nmcli connection modify "$con" connection.autoconnect yes 2>/dev/null
+      sleep 2; cmd_wifi show
+      ;;
+    scan)
+      echo "→ Сканирую сети на $WAN_WIFI…"
+      nmcli device wifi rescan ifname "$WAN_WIFI" >/dev/null 2>&1; sleep 2
+      nmcli -f SSID,SIGNAL,SECURITY device wifi list ifname "$WAN_WIFI"
+      ;;
+    disconnect)
+      echo "→ Выключаю встроенный Wi-Fi ($WAN_WIFI)…"
+      wifi_disable
+      cmd_wifi show
+      ;;
+    mac)
+      # MAC встроенного Wi-Fi через NetworkManager; переживает реконнекты.
+      local con; con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+        | awk -F: -v d="$WAN_WIFI" '$2==d{print $1; exit}')
+      case "${2:-show}" in
+        random)
+          if [ -z "$con" ]; then echo "Нет активного Wi-Fi соединения на $WAN_WIFI"; exit 1; fi
+          echo "→ Случайный MAC при каждом подключении для «$con»…"
+          nmcli connection modify "$con" wifi.cloned-mac-address random
+          nmcli connection up "$con" >/dev/null 2>&1
+          echo "Текущий MAC: $(cat /sys/class/net/$WAN_WIFI/address)"
+          ;;
+        reset)
+          [ -z "$con" ] && { echo "Нет активного Wi-Fi соединения"; exit 1; }
+          nmcli connection modify "$con" wifi.cloned-mac-address permanent
+          nmcli connection up "$con" >/dev/null 2>&1
+          echo "MAC сброшен на заводской: $(cat /sys/class/net/$WAN_WIFI/address)"
+          ;;
+        show|"")
+          echo "MAC $WAN_WIFI: $(cat /sys/class/net/$WAN_WIFI/address 2>/dev/null)"
+          [ -n "$con" ] && echo "Режим: $(nmcli -g 802-11-wireless.cloned-mac-address connection show "$con" 2>/dev/null)" || true
+          ;;
+        *)
+          if [[ "${2}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+            [ -z "$con" ] && { echo "Нет активного Wi-Fi соединения"; exit 1; }
+            nmcli connection modify "$con" wifi.cloned-mac-address "${2}"
+            nmcli connection up "$con" >/dev/null 2>&1
+            echo "MAC задан: $(cat /sys/class/net/$WAN_WIFI/address)"
+          else
+            echo "Формат: gate wifi mac {random|aa:bb:cc:dd:ee:ff|reset}"; exit 1
+          fi
+          ;;
+      esac
+      ;;
+    show|"")
+      local ssid; ssid=$(iw dev "$WAN_WIFI" link 2>/dev/null | awk -F': ' '/SSID/{print $2}')
+      if [ -n "$ssid" ]; then
+        printf "Wi-Fi (%s): подключён к «%s» %s\n" "$WAN_WIFI" "$ssid" "$(iface_ip $WAN_WIFI)"
+      else
+        printf "Wi-Fi (%s): не подключён\n" "$WAN_WIFI"
+      fi
+      echo "MAC: $(cat /sys/class/net/$WAN_WIFI/address 2>/dev/null)"
+      ;;
+    *) echo "gate wifi {connect \"SSID\" [pass]|scan|disconnect|mac ...|show}";;
+  esac
+}
+
+# Найти NM-соединение, привязанное к eth0 (активное или по interface-name).
+eth_con(){
+  local c
+  c=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+      | awk -F: -v d="$WAN_ETH" '$2==d{print $1; exit}')
+  if [ -z "$c" ]; then
+    while IFS=: read -r name typ; do
+      [ "$typ" = "802-3-ethernet" ] || continue
+      [ "$(nmcli -g connection.interface-name connection show "$name" 2>/dev/null)" = "$WAN_ETH" ] \
+        && { c="$name"; break; }
+    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null)
+  fi
+  printf '%s' "$c"
+}
+
+# ─── Команда: eth ─ всё про Ethernet-WAN (eth0) ───────────────────────
+cmd_eth(){
+  local sub="${1:-show}"
+  case "$sub" in
+    mac) shift; cmd_eth_mac "${1:-show}" ;;
+    show|"")
+      if has_carrier "$WAN_ETH"; then
+        printf "Ethernet (%s): link up %s\n" "$WAN_ETH" "$(iface_ip $WAN_ETH)"
+      else
+        printf "Ethernet (%s): кабель не подключён\n" "$WAN_ETH"
+      fi
+      echo "MAC: $(cat /sys/class/net/$WAN_ETH/address 2>/dev/null)"
+      ;;
+    *) echo "gate eth {mac ...|show}";;
+  esac
+}
+
+# ─── MAC Ethernet-WAN (eth0) через NetworkManager. Переживает реконнекты.
+cmd_eth_mac(){
+  local action="${1:-show}"
+  local con; con=$(eth_con)
+  case "$action" in
+    random)
+      [ -z "$con" ] && { echo "Не найдено NM-соединение для $WAN_ETH"; exit 1; }
+      echo "→ Случайный MAC при каждом подключении $WAN_ETH («$con»)…"
+      sudo nmcli connection modify "$con" ethernet.cloned-mac-address random
+      sudo nmcli connection up "$con" >/dev/null 2>&1; sleep 1
+      echo "Текущий MAC: $(cat /sys/class/net/$WAN_ETH/address)"
+      ;;
+    reset)
+      [ -z "$con" ] && { echo "Не найдено NM-соединение для $WAN_ETH"; exit 1; }
+      sudo nmcli connection modify "$con" ethernet.cloned-mac-address permanent
+      sudo nmcli connection up "$con" >/dev/null 2>&1; sleep 1
+      echo "MAC сброшен на заводской: $(cat /sys/class/net/$WAN_ETH/address)"
+      ;;
+    show|"")
+      echo "MAC $WAN_ETH: $(cat /sys/class/net/$WAN_ETH/address 2>/dev/null)"
+      local perm; perm=$(ethtool -P "$WAN_ETH" 2>/dev/null | awk '{print $NF}')
+      [ -n "$perm" ] && [ "$perm" != "00:00:00:00:00:00" ] && echo "Заводской:   $perm"
+      [ -n "$con" ] && echo "Режим:       $(nmcli -g 802-3-ethernet.cloned-mac-address connection show "$con" 2>/dev/null)" || true
+      ;;
+    *)
+      if [[ "$action" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        [ -z "$con" ] && { echo "Не найдено NM-соединение для $WAN_ETH"; exit 1; }
+        sudo nmcli connection modify "$con" ethernet.cloned-mac-address "$action"
+        sudo nmcli connection up "$con" >/dev/null 2>&1; sleep 1
+        echo "MAC задан: $(cat /sys/class/net/$WAN_ETH/address)"
+      else
+        echo "Формат: gate eth mac {random|aa:bb:cc:dd:ee:ff|reset}"; exit 1
+      fi
+      ;;
+  esac
+}
+
+# ─── Команда: ap ──────────────────────────────────────────────────────
+HOSTAPD_CONF="/etc/hostapd/hostapd.conf"
+
+# случайный locally-administered unicast MAC (первый октет 02)
+rand_mac(){ printf '02:%02x:%02x:%02x:%02x:%02x' \
+  $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)); }
+
+ap_set_mac(){
+  local mac="$1"
+  echo "→ Меняю MAC $AP_IFACE на $mac…"
+  sudo systemctl stop hostapd
+  sudo ip link set dev "$AP_IFACE" down
+  sudo ip link set dev "$AP_IFACE" address "$mac"
+  sudo ip link set dev "$AP_IFACE" up
+  sudo systemctl start hostapd
+  echo "Текущий MAC: $(cat /sys/class/net/$AP_IFACE/address)"
+}
+
+cmd_ap(){
+  case "${1:-show}" in
+    on)    sudo systemctl start hostapd dnsmasq; echo "AP запущена";;
+    off)   sudo systemctl stop hostapd; echo "AP остановлена";;
+    restart)  sudo systemctl restart hostapd dnsmasq; echo "AP перезапущена";;
+
+    ssid)
+      local new="${2:-}"
+      [ -z "$new" ] && { echo "Использование: gate ap ssid \"Новое имя\""; exit 1; }
+      sudo sed -i "s/^ssid=.*/ssid=$new/" "$HOSTAPD_CONF"
+      sudo systemctl restart hostapd
+      echo "SSID → «$new» (AP перезапущена)"
+      ;;
+
+    pass|password)
+      local new="${2:-}"
+      [ -z "$new" ] && { echo "Использование: gate ap pass \"новый_пароль\""; exit 1; }
+      if [ "${#new}" -lt 8 ]; then echo "Пароль WPA2 должен быть ≥8 символов"; exit 1; fi
+      sudo sed -i "s/^wpa_passphrase=.*/wpa_passphrase=$new/" "$HOSTAPD_CONF"
+      sudo systemctl restart hostapd
+      echo "Пароль изменён (AP перезапущена)"
+      ;;
+
+    mac)
+      case "${2:-show}" in
+        random) ap_set_mac "$(rand_mac)";;
+        reset)
+          local perm; perm=$(ethtool -P "$AP_IFACE" 2>/dev/null | awk '{print $NF}')
+          [ -z "$perm" ] && { echo "Не удалось определить заводской MAC"; exit 1; }
+          ap_set_mac "$perm"; echo "(сброшен на заводской)"
+          ;;
+        show|"") echo "MAC $AP_IFACE: $(cat /sys/class/net/$AP_IFACE/address)";;
+        *)
+          if [[ "${2}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+            ap_set_mac "${2}"
+          else
+            echo "Неверный MAC. Формат: aa:bb:cc:dd:ee:ff | random | reset | show"; exit 1
+          fi
+          ;;
+      esac
+      ;;
+
+    show|*)
+      printf "AP (%s): " "$AP_IFACE"
+      svc_active hostapd && printf "%s\n" "$(ok)" || printf "%s\n" "$(bad)"
+      printf "SSID:    %s\n" "$(awk -F= '/^ssid=/{print $2}' $HOSTAPD_CONF 2>/dev/null)"
+      printf "MAC:     %s\n" "$(cat /sys/class/net/$AP_IFACE/address 2>/dev/null)"
+      printf "Клиентов: %s\n" "$(iw dev $AP_IFACE station dump 2>/dev/null | grep -c '^Station')"
+      ;;
+  esac
+}
+
+# ─── Команда: clients ─────────────────────────────────────────────────
+# Показывает подключённые устройства: IP, MAC, имя, сигнал, время аренды.
+# Источники: dnsmasq leases (IP/имя) + hostapd station dump (кто реально в эфире).
+cmd_clients(){
+  # MAC-адреса станций, реально ассоциированных с AP прямо сейчас
+  local assoc; assoc=$(iw dev "$AP_IFACE" station dump 2>/dev/null | awk '/^Station/{print tolower($2)}')
+
+  printf "\n%s┌─ Клиенты на %s ──────────────────────────────────%s\n" "$CYA" "$AP_IFACE" "$R"
+  printf "%s│%s %-15s %-17s %-16s %s\n" "$CYA" "$R" "IP" "MAC" "Имя" "Статус"
+  printf "%s├──────────────────────────────────────────────────────────%s\n" "$CYA" "$R"
+
+  if [ ! -f "$DHCP_LEASES" ]; then
+    printf "%s│%s файл аренд не найден: %s\n" "$CYA" "$R" "$DHCP_LEASES"
+    printf "%s└──────────────────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+    return
+  fi
+
+  local found=0
+  # формат dnsmasq.leases: <expiry> <mac> <ip> <hostname> <clientid>
+  while read -r exp mac ip name _; do
+    [ -z "$ip" ] && continue
+    found=1
+    local low; low=$(printf '%s' "$mac" | tr 'A-Z' 'a-z')
+    local status sig
+    if printf '%s\n' "$assoc" | grep -q "$low"; then
+      # сигнал из station dump
+      sig=$(iw dev "$AP_IFACE" station dump 2>/dev/null \
+            | awk -v m="$low" 'BEGIN{IGNORECASE=1} /^Station/{cur=tolower($2)} /signal:/{if(cur==m){print $2" dBm"; exit}}')
+      status="${GRN}online${R} ${D}${sig}${R}"
+    else
+      status="${GRY}offline${R}"
+    fi
+    printf "%s│%s %-15s %-17s %-16s %b\n" "$CYA" "$R" "$ip" "$mac" "${name:-—}" "$status"
+  done < "$DHCP_LEASES"
+
+  [ "$found" = "0" ] && printf "%s│%s %sнет активных аренд%s\n" "$CYA" "$R" "$GRY" "$R"
+
+  printf "%s└──────────────────────────────────────────────────────────%s\n" "$CYA" "$R"
+  printf "%s%s online%s — в эфире сейчас, %soffline%s — есть аренда, но не подключён\n\n" \
+    "$D" "$GRN" "$R$D" "$GRY" "$R"
+}
+
+# ─── Команда: tunnel (TPROXY data plane) ──────────────────────────────
+# Поднимает/опускает перехват клиентского трафика в xray TPROXY.
+# WG больше нет: клиент → TPROXY :12345 → reality-s1 → C1(реле) → C2.
+# Реальную работу делают gate-tproxy-up.sh / gate-tproxy-down.sh.
+
+cmd_tunnel(){
+  case "${1:-status}" in
+    up)
+      if ! svc_active "$XRAY_SVC"; then
+        echo "xray не запущен — поднимаю…"; sudo systemctl start "$XRAY_SVC"; sleep 1
+      fi
+      sudo bash "$TPROXY_UP"
+      echo "Проверка выхода цепочки…"; sleep 1
+      local ip; ip=$(tunnel_exit_ip 10)
+      printf "  Exit IP: %s%s%s\n" "$YEL" "${ip:-не определён (проверь xray/C1)}" "$R"
+      ;;
+
+    down)
+      echo "→ Опускаю tproxy…"
+      sudo bash "$TPROXY_DOWN"
+      echo "Перехват снят. Клиентский трафик заблокирован (fail-closed)."
+      ;;
+
+    restart) cmd_tunnel down; sleep 1; cmd_tunnel up ;;
+
+    status|*)
+      printf "\n%s┌─ Туннель (TPROXY) ────────────────────────────%s\n" "$CYA" "$R"
+      printf "%s│%s tproxy: " "$CYA" "$R"
+      if tproxy_active; then printf "%s  перехват → :%s\n" "$(ok)" "$TPROXY_PORT"
+      else printf "%s опущен (fail-closed)\n" "$(bad)"; fi
+      printf "%s│%s xray:   %s\n" "$CYA" "$R" "$(svc_active "$XRAY_SVC" && ok || bad)"
+      printf "%s│%s rules:  %s/2 (fwmark 1→tproxy, 255→WAN)\n" "$CYA" "$R" \
+        "$(ip -4 rule show | grep -cE 'fwmark 0x(1|ff) ')"
+      printf "%s│%s killsw: %s\n" "$CYA" "$R" \
+        "$(sudo iptables -S FORWARD 2>/dev/null | grep -qc "$AP_SUBNET -j DROP" && echo ok || echo нет)"
+      printf "%s│%s exit:   %s%s%s\n" "$CYA" "$R" "$YEL" "$(tunnel_exit_ip 6)" "$R"
+      printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+      ;;
+  esac
+}
+
+# ─── Команда: socks (финальный хоп через покупной SOCKS5) ─────────────
+# Носок надевается на С2 (дозвон от С2, прокси видит IP С2, не тебя).
+# Управление с малины через SSH-цепочку малина→С1→С2 (С2 видит только С1).
+# Killswitch fail-closed: носок включён и упал → клиентский трафик встаёт,
+# IP С2 НЕ вытекает. UDP режется (нет утечек мимо носка).
+
+# выполнить команду на ВЫХОДНОМ хопе через SSH-цепочку (Pi→C1→…→exit).
+# Ключи-на-хопах: малина→C1 ключом малины, C1→C2 ключом C1, и т.д. Вложенную
+# команду (с экранированием на каждом уровне) строит рендерер по chain.json.
+s2_exec(){
+  local full
+  full="$(printf '%s' "$1" | python3 "$RENDER" exit-cmd "$CHAIN_JSON" 2>/dev/null)" || return 1
+  [ -n "$full" ] || return 1
+  bash -c "$full"
+}
+
+# Проба возможностей носка С ТОЧКИ ВЫХОДА (C2): TCP+auth, remote-DNS (CONNECT по
+# домену), UDP (UDP ASSOCIATE + реальный DNS-запрос через релей — функционально,
+# т.к. носки врут на handshake). Нужны SOCKS_IP/PORT/USER/PASS в окружении.
+# Печатает: TCP=ok|fail / RDNS=ok|fail / UDP=ok|fail / EXIT_IP=...
+socks_probe(){
+  local py
+  py=$(cat <<PYEOF
+import socket,struct,os
+IP="$SOCKS_IP";PORT=int("$SOCKS_PORT");USER="$SOCKS_USER";PW="$SOCKS_PASS"
+def greet(s):
+    if USER:
+        s.sendall(b"\x05\x01\x02");r=s.recv(2)
+        if len(r)<2 or r[1]!=2: return False
+        u=USER.encode();p=PW.encode()
+        s.sendall(b"\x01"+bytes([len(u)])+u+bytes([len(p)])+p);r=s.recv(2)
+        return len(r)>=2 and r[1]==0
+    s.sendall(b"\x05\x01\x00");r=s.recv(2);return len(r)>=2 and r[1]==0
+def conn(s,atyp,addr,port):
+    s.sendall(b"\x05\x01\x00"+bytes([atyp])+addr+struct.pack(">H",port));r=s.recv(4)
+    if len(r)<4: return None
+    rep=r[1];at=r[3]
+    if at==1: s.recv(4)
+    elif at==3: s.recv(s.recv(1)[0])
+    elif at==4: s.recv(16)
+    s.recv(2);return rep
+def dnsq(name):
+    q=os.urandom(2)+b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for part in name.split("."): q+=bytes([len(part)])+part.encode()
+    return q+b"\x00\x00\x01\x00\x01"
+def tcp_rdns():
+    try:
+        s=socket.create_connection((IP,PORT),timeout=10)
+        if not greet(s): s.close();return("fail","fail","")
+        d=b"api.ipify.org"
+        if conn(s,3,bytes([len(d)])+d,80)==0:
+            s.sendall(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+            s.settimeout(10);buf=b""
+            while True:
+                try: c=s.recv(4096)
+                except: break
+                if not c: break
+                buf+=c
+            s.close()
+            body=buf.split(b"\r\n\r\n",1)[-1].strip().decode("utf-8","ignore")
+            return("ok","ok",body.splitlines()[-1].strip() if body else "")
+        s.close()
+    except: pass
+    try:
+        s=socket.create_connection((IP,PORT),timeout=10)
+        if not greet(s): s.close();return("fail","fail","")
+        rep=conn(s,1,socket.inet_aton("1.1.1.1"),80);s.close()
+        return("ok" if rep==0 else "fail","fail","")
+    except: return("fail","fail","")
+def udp():
+    try:
+        s=socket.create_connection((IP,PORT),timeout=10)
+        if not greet(s): s.close();return"fail"
+        s.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00");r=s.recv(4)
+        if len(r)<4 or r[1]!=0: s.close();return"fail"
+        at=r[3]
+        if at==1: ra=socket.inet_ntoa(s.recv(4))
+        elif at==3: ra=s.recv(s.recv(1)[0]).decode()
+        elif at==4: ra=socket.inet_ntop(socket.AF_INET6,s.recv(16))
+        else: s.close();return"fail"
+        rp=struct.unpack(">H",s.recv(2))[0]
+        if ra in ("0.0.0.0",""): ra=IP
+        q=dnsq("example.com")
+        hdr=b"\x00\x00\x00\x01"+socket.inet_aton("8.8.8.8")+struct.pack(">H",53)
+        u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.settimeout(6)
+        u.sendto(hdr+q,(ra,rp));data,_=u.recvfrom(2048);u.close();s.close()
+        dns=data[10:]
+        return "ok" if (len(dns)>=12 and dns[:2]==q[:2]) else "fail"
+    except: return"fail"
+t,rd,ip=tcp_rdns();ud=udp()
+print("TCP="+t);print("RDNS="+rd);print("UDP="+ud);print("EXIT_IP="+ip)
+PYEOF
+)
+  s2_exec "python3 - <<'XPY'
+$py
+XPY"
+}
+
+# Сохранить возможности носка в /etc/gate/socks.caps (читает chain-render).
+socks_caps_set(){
+  local tcp rdns udp
+  tcp=$(printf '%s\n' "$1" | sed -n 's/^TCP=//p'); rdns=$(printf '%s\n' "$1" | sed -n 's/^RDNS=//p')
+  udp=$(printf '%s\n' "$1" | sed -n 's/^UDP=//p')
+  sudo bash -c "mkdir -p /etc/gate; cat > $SOCKS_CAPS <<EOF
+TCP=${tcp:-fail}
+RDNS=${rdns:-fail}
+UDP=${udp:-fail}
+EOF
+chown pi:pi $SOCKS_CAPS"
+}
+
+cmd_socks(){
+  case "${1:-status}" in
+    test)
+      if [ -n "${2:-}" ]; then
+        SOCKS_IP="$2"; SOCKS_PORT="${3:-}"; SOCKS_USER="${4:-}"; SOCKS_PASS="${5:-}"
+      else
+        [ -f "$SOCKS_CONF" ] || { echo "Нет носка. Укажи: gate socks test <ip> <port> [user] [pass]"; exit 1; }
+        eval "$(sudo cat "$SOCKS_CONF" 2>/dev/null)"
+      fi
+      echo "→ Проба носка $SOCKS_IP:$SOCKS_PORT с C2 (TCP / remote-DNS / UDP)…"
+      local caps; caps=$(socks_probe | tr -d '\r')
+      local tcp rdns udp eip
+      tcp=$(printf '%s\n' "$caps" | sed -n 's/^TCP=//p'); rdns=$(printf '%s\n' "$caps" | sed -n 's/^RDNS=//p')
+      udp=$(printf '%s\n' "$caps" | sed -n 's/^UDP=//p');  eip=$(printf '%s\n' "$caps" | sed -n 's/^EXIT_IP=//p')
+      if [ "$tcp" != "ok" ]; then
+        printf "  %sНосок НЕ отвечает по TCP%s (мёртв / неверные данные)\n" "$RED" "$R"; exit 1
+      fi
+      mk(){ [ "$1" = ok ] && printf "%sok%s" "$GRN" "$R" || printf "%sнет%s" "$RED" "$R"; }
+      printf "  TCP+auth:   %s   выходной IP: %s%s%s\n" "$(mk "$tcp")" "$YEL" "${eip:-?}" "$R"
+      printf "  remote-DNS: %s   (носок сам резолвит домены → его резолвер виден)\n" "$(mk "$rdns")"
+      printf "  UDP:        %s   (UDP ASSOCIATE → QUIC/UDP-приложения)\n" "$(mk "$udp")"
+      if [ -n "$eip" ]; then
+        local geo; geo=$(s2_exec "curl -s --max-time 10 http://ip-api.com/line/$eip?fields=country,regionName,city,isp 2>/dev/null")
+        [ -n "$geo" ] && printf "  гео:        %s\n" "$(echo "$geo" | tr '\n' ' ')"
+      fi
+      ;;
+    set)
+      # gate socks set <ip> <port> [user] [pass]
+      local ip="${2:-}" port="${3:-}" user="${4:-}" pass="${5:-}"
+      if [ -z "$ip" ] || [ -z "$port" ]; then
+        echo "Использование: gate socks set <ip> <port> [user] [pass]"; exit 1
+      fi
+      sudo mkdir -p /etc/gate
+      sudo bash -c "umask 077; cat > $SOCKS_CONF <<EOF
+SOCKS_IP=$ip
+SOCKS_PORT=$port
+SOCKS_USER=$user
+SOCKS_PASS=$pass
+EOF"
+      sudo rm -f "$SOCKS_CAPS"   # старые возможности неактуальны для нового носка
+      echo "Носок сохранён: $ip:$port${user:+ (auth: $user)}"
+      echo "Проверить: gate socks test   •   включить: gate socks on"
+      ;;
+
+    on)
+      [ -f "$SOCKS_CONF" ] || { echo "Сначала задай носок: gate socks set ..."; exit 1; }
+      ensure_exclusive socks || exit 0
+      eval "$(sudo cat "$SOCKS_CONF" 2>/dev/null)"
+      echo "→ Пробую носок $SOCKS_IP:$SOCKS_PORT (TCP / remote-DNS / UDP)…"
+      local caps; caps=$(socks_probe | tr -d '\r')
+      local tcp rdns udp
+      tcp=$(printf '%s\n' "$caps" | sed -n 's/^TCP=//p'); rdns=$(printf '%s\n' "$caps" | sed -n 's/^RDNS=//p')
+      udp=$(printf '%s\n' "$caps" | sed -n 's/^UDP=//p')
+      if [ "$tcp" != "ok" ]; then
+        echo "  ${RED}✗ носок не отвечает по TCP — не включаю (fail-closed)${R}"; exit 1
+      fi
+      printf "  возможности: TCP=%s  remote-DNS=%s  UDP=%s\n" "$tcp" "$rdns" "$udp"
+      socks_caps_set "$caps"
+      # роутинг на C2: UDP→носок если умеет, иначе blackhole (fail-closed)
+      local udprule
+      if [ "$udp" = "ok" ]; then
+        udprule='{"type":"field","network":"udp","outboundTag":"socks-out"}'
+        echo "  → UDP через носок ВКЛ (QUIC/UDP оживают)"
+      else
+        udprule='{"type":"field","network":"udp","outboundTag":"blocked"}'
+        echo "  → UDP режется (носок не умеет UDP)"
+      fi
+      [ "$rdns" = ok ] && echo "  → DNS резолвит носок (его резолвер)" || echo "  → DNS резолвит малина (Cloudflare), несём IP"
+      echo "→ Включаю носок на С2 (через цепочку)…"
+      local py
+      py=$(cat <<PYEOF
+import json
+p="$EXIT_XRAY_CONF"
+c=json.load(open(p))
+# Hardening: при включённом носке УБИРАЕМ direct совсем. Остаются только
+# socks-out и blocked, причём blocked ПЕРВЫЙ → дефолтный outbound = дроп.
+# Прямого выхода с C2 не существует физически: утечь его IP невозможно даже
+# при баге в правилах (нечем выйти, кроме носка).
+sock={"tag":"socks-out","protocol":"socks","settings":{"servers":[{"address":"$SOCKS_IP","port":int("$SOCKS_PORT")}]}}
+if "$SOCKS_USER":
+    sock["settings"]["servers"][0]["users"]=[{"user":"$SOCKS_USER","pass":"$SOCKS_PASS"}]
+c["outbounds"]=[{"tag":"blocked","protocol":"blackhole"}, sock]
+c["routing"]={"domainStrategy":"AsIs","rules":[
+  {"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},
+  $udprule,
+  {"type":"field","network":"tcp","outboundTag":"socks-out"},
+  {"type":"field","network":"tcp,udp","outboundTag":"blocked"}
+]}
+json.dump(c,open(p,"w"),indent=2)
+print("ON")
+PYEOF
+)
+      s2_exec "python3 - <<'XPY'
+$py
+XPY
+systemctl restart xray && sleep 2 && systemctl is-active xray"
+      echo on | sudo tee "$SOCKS_STATE" >/dev/null
+      echo "→ Подстраиваю DNS/QUIC-политику малины под носок…"
+      render_pi_apply
+      echo "Проверка выхода…"; sleep 2
+      cmd_socks status
+      ;;
+
+    off)
+      echo "→ Выключаю носок, возврат на прямой выход С2 (через цепочку)…"
+      local py
+      py=$(cat <<'PYEOF'
+import json
+p="/usr/local/etc/xray/config.json"
+c=json.load(open(p))
+# Носок снят: пересобираем outbounds в [direct, blocked] (direct первый = дефолт),
+# чтобы C2 снова выходил в интернет напрямую. socks-out удаляется.
+c["outbounds"]=[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"AsIs"}},
+                {"tag":"blocked","protocol":"blackhole"}]
+c["routing"]={"domainStrategy":"AsIs","rules":[
+  {"type":"field","ip":["geoip:private"],"outboundTag":"blocked"}
+]}
+json.dump(c,open(p,"w"),indent=2)
+print("OFF")
+PYEOF
+)
+      s2_exec "python3 - <<'XPY'
+$py
+XPY
+systemctl restart xray && sleep 2 && systemctl is-active xray"
+      echo off | sudo tee "$SOCKS_STATE" >/dev/null
+      echo "→ Возвращаю DNS-политику малины (резолв через Cloudflare, QUIC режется)…"
+      render_pi_apply
+      echo "Носок снят. Выход напрямую с С2."; sleep 2
+      cmd_socks status
+      ;;
+
+    status)
+      printf "\n%s┌─ Носок (SOCKS5 финальный хоп) ────────────────%s\n" "$CYA" "$R"
+      if [ -f "$SOCKS_CONF" ]; then
+        eval "$(sudo cat "$SOCKS_CONF" 2>/dev/null)"
+        printf "%s│%s сохранён: %s:%s%s\n" "$CYA" "$R" "$SOCKS_IP" "$SOCKS_PORT" \
+          "${SOCKS_USER:+ (auth)}"
+      else
+        printf "%s│%s носок не задан\n" "$CYA" "$R"
+      fi
+      if [ -f "$SOCKS_CAPS" ]; then
+        cap(){ grep -E "^$1=" "$SOCKS_CAPS" 2>/dev/null | cut -d= -f2; }
+        printf "%s│%s умеет:   TCP=%s remote-DNS=%s UDP=%s\n" "$CYA" "$R" \
+          "$(cap TCP)" "$(cap RDNS)" "$(cap UDP)"
+      fi
+      # режим определяем по наличию socks-out в конфиге С2
+      local mode; mode=$(s2_exec "grep -c socks-out $EXIT_XRAY_CONF 2>/dev/null" 2>/dev/null)
+      if [ "${mode:-0}" -gt 0 ] 2>/dev/null; then
+        printf "%s│%s режим:   %sВКЛЮЧЁН%s (трафик через носок)\n" "$CYA" "$R" "$GRN" "$R"
+      else
+        printf "%s│%s режим:   %sвыключен%s (прямой выход С2)\n" "$CYA" "$R" "$YEL" "$R"
+      fi
+      # выходной IP цепочки (через socks-test → C1 → C2 → носок)
+      local ip; ip=$(tunnel_exit_ip 8)
+      printf "%s│%s выход:   %s%s%s\n" "$CYA" "$R" "$YEL" "${ip:-—}" "$R"
+      printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+      ;;
+
+    *)
+      echo "gate socks {set <ip> <port> [user] [pass]|on|off|status}"
+      ;;
+  esac
+}
+
+# ─── Команда: dns — проверка DNS-утечки (browserleaks-стиль) ──────────
+# Резолвит уникальные имена через ВЫХОД цепочки (edns.ip-api.com отдаёт IP/гео
+# резолвера, что реально queried) — несколько проб, т.к. у носка пул резолверов.
+# Критично: DNS должен идти СО СТОРОНЫ ВЫХОДА (носок), НИКОГДА с C2. Утечку ловим
+# по совпадению страны резолвера со страной выходного хопа C2.
+# Запасной DNS (Cloudflare+Google) для VPN-режима, если туннель свой DNS не отдал.
+# По правилу «не добавлять свои дефолты молча» — по умолчанию off, включается только явно.
+dns_fallback_set(){
+  case "${1:-}" in
+    on|off)
+      echo "$1" | sudo tee "$DNS_FALLBACK_STATE" >/dev/null
+      echo "Запасной DNS: $1  ($DNS_FALLBACK_SERVERS — только если туннель свой DNS не дал)"
+      [ "$1" = on ] && [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ] && \
+        echo "  ${D}применится при следующем gate <type> on (сейчас VPN уже поднят)${R}" ;;
+    ""|status)
+      echo "Запасной DNS: $(cat "$DNS_FALLBACK_STATE" 2>/dev/null || echo off)  ($DNS_FALLBACK_SERVERS)" ;;
+    *) echo "gate dns fallback {on|off|status}" ;;
+  esac
+}
+# Резолвер САМОЙ малины для ПРЯМОГО выхода (нет VPN/носка) — переключатель Cloudflare/Google/Quad9.
+# Влияет на прямой режим и Force-DNS; в VPN DNS идёт из туннеля, в socks-RDNS резолвит носок.
+dns_resolver_set(){
+  local p="${1:-}" names
+  case "$p" in
+    cloudflare|cf) p=cloudflare; names="'cloudflare'" ;;
+    quad9|q9|q)    p=quad9;      names="'quad9-dnscrypt-ip4-nofilter-pri', 'quad9-doh-ip4-port443-nofilter-pri'" ;;
+    ""|status)
+      printf "Резолвер малины (прямой выход): %s%s%s\n" "$GRN" "$(grep -m1 '^server_names' "$DNSCRYPT_TOML" 2>/dev/null | sed 's/.*= //')" "$R"
+      echo "  ${D}переключить: gate dns resolver {cloudflare|quad9}${R}"; return ;;
+    *) echo "gate dns resolver {cloudflare|quad9}  (google не отвечает с РФ-IP)"; return ;;
+  esac
+  [ -f "$DNSCRYPT_TOML" ] || { echo "  ✗ нет $DNSCRYPT_TOML на малине"; return 1; }
+  sudo cp -a "$DNSCRYPT_TOML" "$DNSCRYPT_TOML.bak-$(date +%Y%m%d-%H%M%S)"
+  sudo sed -i "s/^server_names = .*/server_names = [$names]/" "$DNSCRYPT_TOML"
+  sudo systemctl restart dnscrypt-proxy; sleep 3
+  if systemctl is-active --quiet dnscrypt-proxy; then
+    echo "Резолвер малины (прямой выход) → ${GRN}$p${R}  [$names]"
+    echo "  ${D}действует в режиме «прямой C2»; проверить: gate dns${R}"
+  else
+    echo "  ${RED}✗ dnscrypt-proxy не поднялся${R} — бэкап рядом: $DNSCRYPT_TOML.bak-*"
+  fi
+}
+cmd_dns(){
+  case "${1:-}" in
+    fallback) shift; dns_fallback_set "$@"; return ;;
+    resolver) shift; dns_resolver_set "$@"; return ;;
+  esac
+  local n="${1:-4}"; [[ "$n" =~ ^[0-9]+$ ]] || n=4
+  local jget='import sys,json
+try: d=json.load(sys.stdin)
+except: d={}'
+  printf "\n%s┌─ DNS-утечка (что видит мир) ───────────────────%s\n" "$CYA" "$R"
+  # выход цепочки + гео (socks-test → C1 → C2 → выход)
+  local ej eip ecountry eisp
+  ej=$(curl -s --max-time 12 --socks5-hostname "$SOCKS_TEST" "http://ip-api.com/json?fields=query,country,isp" 2>/dev/null)
+  eip=$(printf '%s' "$ej"      | python3 -c "$jget
+print(d.get('query',''))" 2>/dev/null)
+  ecountry=$(printf '%s' "$ej" | python3 -c "$jget
+print(d.get('country',''))" 2>/dev/null)
+  eisp=$(printf '%s' "$ej"     | python3 -c "$jget
+print(d.get('isp',''))" 2>/dev/null)
+  if [ -z "$eip" ]; then
+    printf "%s│%s %sвыход не отвечает — цепочка/выход не поднят%s\n" "$CYA" "$R" "$RED" "$R"
+    printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"; return 1
+  fi
+  printf "%s│%s выход:  %s%s%s  %s%s · %s%s\n" "$CYA" "$R" "$YEL" "$eip" "$R" "$D" "${ecountry:-?}" "${eisp:-?}" "$R"
+  # C2 (выходной хоп) — эталон «как выглядела бы утечка»
+  local c2h c2c
+  c2h=$(exit_host)
+  c2c=$(curl -s --max-time 8 "http://ip-api.com/line/$c2h?fields=country" 2>/dev/null | tr -d '\r\n')
+  [ -n "$c2c" ] && printf "%s│%s C2:     %s%s · %s — сюда DNS уходить НЕ должен%s\n" "$CYA" "$R" "$D" "$c2h" "$c2c" "$R"
+  # резолверы через выход (несколько проб → разные резолверы пула носка)
+  printf "%s│%s резолверы DNS (через выход, %d проб):\n" "$CYA" "$R" "$n"
+  local seen="" leak=0 got=0 i
+  for ((i=0;i<n;i++)); do
+    local dj dip dgeo dcountry flag
+    dj=$(curl -sL --max-time 12 --socks5-hostname "$SOCKS_TEST" "https://edns.ip-api.com/json" 2>/dev/null)
+    dip=$(printf '%s' "$dj"  | python3 -c "$jget
+print(d.get('dns',{}).get('ip',''))" 2>/dev/null)
+    dgeo=$(printf '%s' "$dj" | python3 -c "$jget
+print(d.get('dns',{}).get('geo',''))" 2>/dev/null)
+    [ -z "$dip" ] && continue
+    case "$seen" in *"|$dip|"*) continue ;; esac
+    seen="$seen|$dip|"; got=$((got+1))
+    dcountry=${dgeo%% -*}
+    if [ -n "$c2c" ] && [ "$dcountry" = "$c2c" ]; then
+      flag="${RED}✗ страна C2 — УТЕЧКА${R}"; leak=1
+    elif [ -n "$ecountry" ] && [ "$dcountry" = "$ecountry" ]; then
+      flag="${GRN}✓ сторона выхода${R}"
+    else
+      flag="${YEL}⚠ иная страна${R}"
+    fi
+    printf "%s│%s   %-15s %s%-30s%s %b\n" "$CYA" "$R" "$dip" "$D" "$dgeo" "$R" "$flag"
+  done
+  [ "$got" = 0 ] && printf "%s│%s   %s— не определилось%s\n" "$CYA" "$R" "$RED" "$R"
+  if [ "$leak" = 1 ]; then
+    printf "%s│%s вердикт: %s✗ УТЕЧКА DNS С C2%s — DNS обязан идти только через носок\n" "$CYA" "$R" "$RED" "$R"
+  elif [ "$got" -gt 0 ]; then
+    printf "%s│%s вердикт: %s✓ утечки C2 нет%s (DNS со стороны выхода)\n" "$CYA" "$R" "$GRN" "$R"
+  fi
+  printf "%s│%s глазами браузера: %sbrowserleaks.com/dns%s\n" "$CYA" "$R" "$D" "$R"
+  printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+}
+
+# ─── Команда: vpn ─ второй exit-mode (OpenVPN/PPTP на выходном хопе) ───
+# Залить файл на выходной хоп через цепочку (base64 inline, без stdin-форварда).
+push_to_exit(){  # $1=локальный файл, $2=путь на выходном хопе
+  local b64; b64=$(base64 -w0 "$1" 2>/dev/null) || return 1
+  s2_exec "umask 077; printf '%s' '$b64' | base64 -d > '$2' && echo PUSHED" | grep -q PUSHED
+}
+# Доставить C2-side скрипт gate-vpn на выходной хоп.
+# Идемпотентно и БЕЗ лишнего трафика: сверяем sha256 локального gate-vpn с тем, что на C2, и
+# перезаливаем ТОЛЬКО если версии отличаются или файла нет. Нужная версия и так доставляется
+# при gate setup (deploy_exit_helpers); поэтому gate ovpn on в норме делает лишь лёгкую сверку,
+# а не тяжёлый base64-трансфер через цепочку. Самолечение (переустановили C2) сохранено.
+ensure_vpn_script(){
+  [ -f "$VPN_SCRIPT" ] || { echo "  нет $VPN_SCRIPT на малине"; return 1; }
+  local lh rh
+  lh="$(sha256sum "$VPN_SCRIPT" 2>/dev/null | awk '{print $1}')"
+  rh="$(s2_exec "sha256sum /usr/local/bin/gate-vpn 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d '\r ')"
+  [ -n "$lh" ] && [ "$lh" = "$rh" ] && return 0   # на C2 уже актуальная версия → ничего не делаем
+  echo "  → обновляю gate-vpn на C2 (версия отличается или отсутствует)…"
+  push_to_exit "$VPN_SCRIPT" "/usr/local/bin/gate-vpn" || return 1
+  s2_exec "chmod 755 /usr/local/bin/gate-vpn; echo CHMODOK" >/dev/null
+}
+# Доставить C2-side контроллер gate-osfp + хендлер gate-osfp.py на выходной хоп.
+ensure_osfp_script(){
+  [ -f "$OSFP_SCRIPT" ] || { echo "  нет $OSFP_SCRIPT на малине"; return 1; }
+  [ -f "$OSFP_PY" ]     || { echo "  нет $OSFP_PY на малине"; return 1; }
+  push_to_exit "$OSFP_SCRIPT" "/usr/local/bin/gate-osfp"    || return 1
+  push_to_exit "$OSFP_PY"     "/usr/local/bin/gate-osfp.py" || return 1
+  s2_exec "chmod 755 /usr/local/bin/gate-osfp /usr/local/bin/gate-osfp.py; echo CHMODOK" >/dev/null
+}
+
+# ── OS-fingerprint спуф (gate-osfp на выходном хопе) ──────────────────
+# Переписывает исходящие SYN из туннеля под выбранную ОС. Работает только с L3-выходом
+# (PPTP/OpenVPN); с носком неприменим. Включается/выключается ВРУЧНУЮ, VPN сам не трогает.
+cmd_osfp(){
+  case "${1:-status}" in
+    on)
+      local p="${2:-apple}"
+      case "$p" in apple|windows|linux) ;; *) echo "gate osfp on {apple|windows|linux}"; exit 1 ;; esac
+      local cur; cur=$(active_exit)
+      case "$cur" in
+        ovpn|pptp) ;;
+        *) echo "  ${YEL}⚠ выход сейчас «$(exit_label "$cur")» — спуф работает только с VPN-выходом (PPTP/OpenVPN).${R}"
+           echo "    ${D}правило поставлю, но эффект будет лишь когда поднимешь gate ovpn/pptp on.${R}" ;;
+      esac
+      echo "→ Доставляю gate-osfp на C2 и включаю профиль $p…"
+      ensure_osfp_script || { echo "не удалось доставить скрипт"; exit 1; }
+      s2_exec "gate-osfp on $p" ;;
+    off)
+      ensure_osfp_script >/dev/null 2>&1   # самозаживление: дозалить контроллер, если на выходе нет
+      echo "→ Выключаю OS-спуф на C2…"
+      s2_exec "gate-osfp off" 2>/dev/null || echo "  (контроллер не отвечает — возможно уже выключен)" ;;
+    status)
+      ensure_osfp_script >/dev/null 2>&1   # самозаживление: если выход свежий/переустановлен — дозальём
+      local out; out=$(s2_exec "gate-osfp status 2>/dev/null" 2>/dev/null)
+      [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /' || echo "  выход не отвечает (цепочка/выход не подняты)" ;;
+    *) echo "gate osfp {on [apple|windows|linux]|off|status}" ;;
+  esac
+}
+
+# ── Общая логика exit-режимов (socks / ovpn / pptp / direct) ──────────
+exit_label(){ case "$1" in socks) echo "носок (SOCKS5)";; ovpn) echo "OpenVPN";; pptp) echo "PPTP";; *) echo "прямой (C2)";; esac; }
+
+active_exit(){  # текущий активный режим выхода
+  [ "$(cat "$SOCKS_STATE" 2>/dev/null)" = on ] && { echo socks; return; }
+  if [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ]; then . "$VPN_META" 2>/dev/null; echo "${TYPE:-ovpn}"; return; fi
+  echo direct
+}
+
+exit_off_one(){  # выключить конкретный активный режим без вопросов
+  case "$1" in socks) cmd_socks off ;; ovpn|pptp|vpn) vpn_off ;; esac
+}
+
+# Перед включением режима $1: если активен ДРУГОЙ — спросить и выключить его.
+# 0 = можно продолжать, 1 = отменено. -y / GATE_YES=1 → без вопроса.
+ensure_exclusive(){
+  local want="$1" cur; cur=$(active_exit)
+  [ "$cur" = direct ] && return 0
+  [ "$cur" = "$want" ] && return 0
+  local ans
+  if [ "${GATE_YES:-0}" = 1 ]; then ans=y
+  elif [ -t 0 ]; then
+    printf "Сейчас активен %s«%s»%s. Переключить на «%s»? [y/N] " "$YEL" "$(exit_label "$cur")" "$R" "$(exit_label "$want")"
+    read -r ans
+  else
+    echo "Активен «$(exit_label "$cur")». Запусти интерактивно или добавь -y, чтобы переключить."; return 1
+  fi
+  case "$ans" in
+    y|Y|yes|YES|да|д|Да) echo "→ Выключаю «$(exit_label "$cur")»…"; exit_off_one "$cur"; return 0 ;;
+    *) echo "Отменено."; return 1 ;;
+  esac
+}
+
+exit_has(){  # есть ли конфиг типа $1 на выходном хопе
+  case "$1" in
+    ovpn) s2_exec "test -f $C2_VPN_DIR/client.ovpn && echo Y" 2>/dev/null | grep -q Y ;;
+    pptp) s2_exec "test -f /etc/ppp/peers/gate-vpn && echo Y" 2>/dev/null | grep -q Y ;;
+  esac
+}
+
+# ── set: залить конфиги на выходной хоп (оба типа могут лежать одновременно) ──
+ovpn_set(){
+  local f="${1:-}" u="${2:-}" pw="${3:-}"
+  [ -f "$f" ] || { echo "Файл не найден: $f  (положи .ovpn на малину, напр. в /mnt/ssd, и укажи путь)"; exit 1; }
+  echo "→ Заливаю конфиг OpenVPN на C2…"
+  ensure_vpn_script || { echo "не удалось доставить скрипт"; exit 1; }
+  s2_exec "umask 077; mkdir -p $C2_VPN_DIR; echo DIROK" >/dev/null
+  # Нормализация под Linux/OpenVPN 2.6: Windows-only директивы (block-outside-dns, register-dns,
+  # dhcp-renew/release) на Linux ФАТАЛЬНЫ («Unrecognized option»), хотя на Windows-роутере друга
+  # глотаются. Префиксуем штатным ignore-unknown-option — строки юзера НЕ трогаем, просто делаем
+  # их терпимыми (на Linux эти опции и так бессмысленны). Так чужой .ovpn заводится без правок.
+  local winopts="block-outside-dns register-dns dhcp-renew dhcp-release"
+  local found; found="$(grep -hoE "^[[:space:]]*(block-outside-dns|register-dns|dhcp-renew|dhcp-release)" "$f" 2>/dev/null | tr -d '[:space:]' | sort -u | tr '\n' ' ')"
+  local ntmp; ntmp="$(mktemp)" || { echo "  ✗ mktemp не удался"; exit 1; }
+  { printf 'ignore-unknown-option %s\n' "$winopts"; cat "$f"; } > "$ntmp"
+  [ -n "$found" ] && echo "  ${YEL}⚠ нормализую Windows-only директивы (на Linux игнорируются):${R} $found"
+  push_to_exit "$ntmp" "$C2_VPN_DIR/client.ovpn" && echo "  ✓ конфиг залит" || { echo "  ✗ заливка не удалась"; rm -f "$ntmp"; exit 1; }
+  rm -f "$ntmp"
+  if [ -n "$u" ]; then
+    s2_exec "umask 077; printf '%s\n%s\n' '$u' '$pw' > $C2_VPN_DIR/auth.txt; echo AUTHOK" >/dev/null
+    echo "  ✓ логин/пароль сохранён на C2"
+  else
+    s2_exec "rm -f $C2_VPN_DIR/auth.txt" >/dev/null 2>&1
+  fi
+  echo "Готово. Включить: gate ovpn on"
+}
+# Линтер .ovpn: проверяет конфиг на совместимость с pi_gate (Linux/OpenVPN 2.6 на C2) и
+# даёт рекомендации. Парсер на python в ЭКРАНИРОВАННОМ heredoc (<<'PYEOF') + имя файла через
+# argv → никакой подстановки шелла (защита от граблей с бэктиками/$()). Только чтение, без сети.
+ovpn_check(){
+  local f="${1:-}"
+  [ -f "$f" ] || { echo "Файл не найден: $f"; echo "Использование: gate ovpn check <файл.ovpn>"; exit 1; }
+  python3 - "$f" <<'PYEOF'
+import sys, re
+f = sys.argv[1]
+try:
+    lines = open(f, errors="replace").read().splitlines()
+except Exception as e:
+    print("не прочитать файл:", e); sys.exit(2)
+
+# вырезаем инлайн-блоки (<ca>…</ca> и т.п.), оставляем только директивы
+directives = []; inblock = False; inline = set()
+for ln in lines:
+    s = ln.strip()
+    m = re.match(r"<(/?)([A-Za-z0-9_-]+)>$", s)
+    if m:
+        if not m.group(1): inblock = True; inline.add(m.group(2).lower())
+        else: inblock = False
+        continue
+    if inblock or not s or s[0] in "#;": continue
+    directives.append(s)
+
+def has(opt): return [d for d in directives if d.split()[0].lower() == opt]
+issues = []
+def add(lvl, msg, fix=""): issues.append((lvl, msg, fix))
+
+if not has("remote"):
+    add("FAIL", "нет директивы «remote» — некуда подключаться", "добавь: remote <host> <port>")
+dev = has("dev")
+if dev and "tap" in dev[0].lower():
+    add("FAIL", "dev tap (L2/мост) — pi_gate работает только через tun (L3)", "нужен конфиг с dev tun")
+
+win = sorted({d.split()[0].lower() for d in directives
+              if d.split()[0].lower() in ("block-outside-dns","register-dns","dhcp-renew","dhcp-release")})
+if win:
+    add("OK", "Windows-only директивы (%s) — авто-нейтрализуются при gate ovpn set" % ", ".join(win))
+
+for opt in ("ca","cert","key","tls-auth","tls-crypt","tls-crypt-v2","pkcs12"):
+    h = has(opt)
+    if h and opt not in inline and len(h[0].split()) > 1:
+        add("FAIL", "«%s %s» ссылается на ВНЕШНИЙ файл — на C2 его нет" % (opt, h[0].split()[1]),
+            "вставь содержимое инлайном: <%s>…</%s> прямо в .ovpn" % (opt, opt))
+
+if has("auth-user-pass"):
+    add("WARN", "сервер требует логин/пароль (auth-user-pass)",
+        "задавай с кредами: gate ovpn set <файл> <user> <pass>")
+
+comp = [d.split()[0].lower() for d in directives if d.split()[0].lower() in ("comp-lzo","compress")]
+if comp:
+    add("WARN", "включена компрессия (%s) — работает, но это риск (VORACLE)" % comp[0],
+        "оставь как есть: должна совпадать с сервером")
+
+ciph = has("cipher")
+if ciph and len(ciph[0].split()) > 1 and ciph[0].split()[1].upper() in ("BF-CBC","DES-CBC","RC2-CBC"):
+    c = ciph[0].split()[1].upper()
+    add("WARN", "устаревший cipher %s (в OpenVPN 2.6 убран из дефолта)" % c,
+        "если не подключится — добавь в .ovpn: data-ciphers-fallback %s" % c)
+
+ico = {"OK": "✓", "WARN": "⚠", "FAIL": "✗"}
+rem, pr = has("remote"), has("proto")
+print("Проверка %s" % f)
+if rem: print("  remote: %s" % " ".join(rem[0].split()[1:]))
+if pr:  print("  proto:  %s" % " ".join(pr[0].split()[1:]))
+print()
+fails = sum(1 for l,_,_ in issues if l == "FAIL")
+warns = sum(1 for l,_,_ in issues if l == "WARN")
+if not issues:
+    print("  ✓ явных несовместимостей не найдено")
+for lvl, msg, fix in issues:
+    print("  %s %s" % (ico[lvl], msg))
+    if fix: print("      → %s" % fix)
+print()
+if fails:
+    print("ИТОГ: критич.=%d, предупр.=%d — как есть НЕ заведётся (см. → выше)" % (fails, warns)); sys.exit(1)
+elif warns:
+    print("ИТОГ: предупр.=%d — должно заработать: gate ovpn set <файл> → gate ovpn test" % warns)
+else:
+    print("ИТОГ: ок — gate ovpn set <файл> → gate ovpn test")
+PYEOF
+}
+pptp_set(){
+  local srv="${1:-}" u="${2:-}" pw="${3:-}"
+  [ -n "$srv" ] && [ -n "$u" ] && [ -n "$pw" ] || { echo "gate pptp set <server> <user> <pass>"; exit 1; }
+  echo "  ${YEL}⚠ PPTP крипта (MS-CHAPv2/MPPE) слабая — нога C2→провайдер расшифровываема.${R}"
+  echo "→ Готовлю gate-vpn на C2 и PPTP-конфиг ($srv)…"
+  ensure_vpn_script || { echo "не удалось доставить скрипт"; exit 1; }
+  s2_exec "umask 077; mkdir -p $C2_VPN_DIR
+mkdir -p /etc/ppp/peers
+cat > /etc/ppp/peers/gate-vpn <<PEER
+pty \"pptp $srv --nolaunchpppd\"
+name $u
+remotename gate-pptp
+require-mppe-128
+refuse-eap
+noauth
+nodefaultroute
+persist
+maxfail 0
+holdoff 5
+usepeerdns
+ipparam gate-vpn
+PEER
+grep -q '^$u gate-pptp ' /etc/ppp/chap-secrets 2>/dev/null || echo '$u gate-pptp $pw *' >> /etc/ppp/chap-secrets
+chmod 600 /etc/ppp/chap-secrets; echo PPTPSET" | grep -q PPTPSET && echo "  ✓ PPTP задан" || echo "  ✗ ошибка"
+  echo "Готово. Включить: gate pptp on"
+}
+
+# ── on/off/status (общие для ovpn и pptp) ──
+vpn_on(){  # $1 = ovpn|pptp
+  local t="$1"
+  echo "→ Поднимаю VPN-выход ($t) на C2 (xray→vpn-out fwmark, killswitch)…"
+  ensure_vpn_script || { echo "  ✗ не удалось обновить gate-vpn на C2"; exit 1; }  # сверка sha256, перезалив лишь при отличии
+  local py
+  py=$(cat <<PYEOF
+import json, os
+p="$EXIT_XRAY_CONF"
+c=json.load(open(p))
+# vpn-out = freedom с меткой fwmark 2 → policy-route в таблицу VPN → tun0/ppp0.
+# direct без метки УБРАН: дефолт=blocked. Нет интерфейса/упал → killswitch (дроп).
+vpn={"tag":"vpn-out","protocol":"freedom","settings":{"domainStrategy":"AsIs"},"streamSettings":{"sockopt":{"mark":2}}}
+c["outbounds"]=[{"tag":"blocked","protocol":"blackhole"}, vpn]
+# DNS-анти-утечка + НАТИВНОСТЬ: используем DNS, которые push'ит сам VPN-сервер (его
+# провайдера, резидентные, совпадают с выходом) — берём из GATE_PUSHED_DNS (общий накопитель
+# /etc/gate/vpn/pushed-dns, заполняют usepeerdns у pptp и up-хук у ovpn). Туннель приоритетен;
+# GATE_DNS_FALLBACK (Cloudflare+Google) подключается ТОЛЬКО если туннель свой DNS не дал и
+# пользователь явно включил 'gate dns fallback on'. Запросы уходят в vpn-out → туннель, НЕ с
+# eth0 C2 (иначе светится российский резолвер C2). IpOnDemand → резолв до маршрута.
+pushed=[x for x in os.environ.get("GATE_PUSHED_DNS","").split() if x]
+fb=[x for x in os.environ.get("GATE_DNS_FALLBACK","").split() if x]
+use = pushed if pushed else fb
+rules=[]
+if use:
+    c["dns"]={"servers": use, "queryStrategy":"UseIPv4"}
+    # DNS может быть приватным шлюзом туннеля → в vpn-out ДО geoip:private, иначе зарежется
+    rules.append({"type":"field","ip":use,"outboundTag":"vpn-out"})
+    ds="IpOnDemand"
+else:
+    c.pop("dns",None)   # ни туннель не дал, ни запасной не включён — своих не навязываем
+    ds="AsIs"
+rules += [
+  {"type":"field","ip":["geoip:private"],"outboundTag":"blocked"},
+  {"type":"field","network":"udp","outboundTag":"vpn-out"},
+  {"type":"field","network":"tcp","outboundTag":"vpn-out"},
+  {"type":"field","network":"tcp,udp","outboundTag":"blocked"}
+]
+c["routing"]={"domainStrategy":ds,"rules":rules}
+json.dump(c,open(p,"w"),indent=2)
+print("XOK dns="+(",".join(c.get("dns",{}).get("servers",[])) or "—"))
+PYEOF
+)
+  # Запасной DNS включаем, только если пользователь явно его попросил (gate dns fallback on).
+  local fb=""; [ "$(cat "$DNS_FALLBACK_STATE" 2>/dev/null)" = on ] && fb="$DNS_FALLBACK_SERVERS"
+  # Поднимаем туннель ПЕРВЫМ → ppp0/tun0 + pushed-DNS (общий накопитель /etc/gate/vpn/pushed-dns:
+  # usepeerdns у pptp, up-хук у ovpn), затем собираем конфиг xray с этими DNS и рестартим.
+  s2_exec "echo $t > $C2_VPN_DIR/type
+gate-vpn up
+GATE_PUSHED_DNS=\"\$(cat $C2_VPN_DIR/pushed-dns 2>/dev/null | tr '\n' ' ')\" \
+GATE_DNS_FALLBACK=\"$fb\" \
+python3 - <<'XPY'
+$py
+XPY
+systemctl restart xray && sleep 2 && systemctl is-active xray"
+  echo on | sudo tee "$VPN_STATE" >/dev/null
+  echo "TYPE=$t" | sudo tee "$VPN_META" >/dev/null
+  # Клиентский DNS в VPN-режиме → тоннельный шлюз (1-й pushed-DNS) через цепочку, чтобы у
+  # КЛИЕНТОВ резолвер был резидентным (как у выхода), а не dnscrypt малины (Quad9/CF).
+  local gw; gw="$(s2_exec "head -1 $C2_VPN_DIR/pushed-dns 2>/dev/null" | tr -d '\r' | awk '{print $1}')"
+  if [ -n "$gw" ]; then
+    echo "$gw" | sudo tee /etc/gate/vpn-dns >/dev/null
+    sudo sed -i "s|^server=.*|server=$gw|" /etc/dnsmasq.d/gate.conf
+    sudo systemctl restart dnsmasq 2>/dev/null
+    echo "→ Клиентский DNS → тоннельный резолвер $gw (резидентный, как выход)"
+  else
+    sudo rm -f /etc/gate/vpn-dns
+    echo "  ${YEL}⚠ pushed-DNS пуст — клиентский DNS остаётся на dnscrypt малины${R}"
+  fi
+  echo "→ Подстраиваю малину (routeOnly, QUIC, клиентский DNS в туннель)…"
+  render_pi_apply; tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
+  echo "Проверка…"; sleep 2; exit_status
+}
+vpn_off(){
+  # Подчищаем БЕЗУСЛОВНО (идемпотентно): неудачный `on` мог оставить C2 в полусостоянии
+  # (pppd/таблица 200/killswitch), а малину — в VPN-роутинге. Поэтому off всегда снимает
+  # туннель, возвращает xray на direct и перерендеривает малину, даже если флаг уже off.
+  if [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ]; then
+    echo "→ Опускаю VPN-выход, возврат на прямой выход C2…"
+  else
+    echo "→ VPN-выход не помечен активным — на всякий случай подчищаю C2 и малину…"
+  fi
+  local py
+  py=$(cat <<'PYEOF'
+import json
+p="/usr/local/etc/xray/config.json"
+c=json.load(open(p))
+c["outbounds"]=[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"AsIs"}},
+                {"tag":"blocked","protocol":"blackhole"}]
+c["routing"]={"domainStrategy":"AsIs","rules":[
+  {"type":"field","ip":["geoip:private"],"outboundTag":"blocked"}
+]}
+json.dump(c,open(p,"w"),indent=2)
+print("XOFF")
+PYEOF
+)
+  s2_exec "gate-vpn down 2>/dev/null; python3 - <<'XPY'
+$py
+XPY
+systemctl restart xray && sleep 2 && systemctl is-active xray"
+  echo off | sudo tee "$VPN_STATE" >/dev/null
+  # вернуть клиентский DNS на dnscrypt малины
+  sudo rm -f /etc/gate/vpn-dns
+  sudo sed -i "s|^server=.*|server=127.0.0.1#5300|" /etc/dnsmasq.d/gate.conf
+  sudo systemctl restart dnsmasq 2>/dev/null
+  echo "→ Возвращаю малину (клиентский DNS → dnscrypt)…"
+  render_pi_apply; tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
+}
+
+exit_status(){  # ЕДИНЫЙ статус выхода цепочки (любой режим) — gate exit
+  local cur; cur=$(active_exit)
+  printf "\n%s┌─ Выход цепочки ───────────────────────────────%s\n" "$CYA" "$R"
+  printf "%s│%s режим:  %s%s%s\n" "$CYA" "$R" "$GRN" "$(exit_label "$cur")" "$R"
+  case "$cur" in
+    ovpn|pptp)
+      s2_exec "gate-vpn status 2>/dev/null" 2>/dev/null | while IFS= read -r l; do printf "%s│%s   %s\n" "$CYA" "$R" "$l"; done ;;
+    socks)
+      if [ -f "$SOCKS_CAPS" ]; then cap(){ grep -E "^$1=" "$SOCKS_CAPS" 2>/dev/null | cut -d= -f2; }
+        printf "%s│%s   умеет: TCP=%s remote-DNS=%s UDP=%s\n" "$CYA" "$R" "$(cap TCP)" "$(cap RDNS)" "$(cap UDP)"; fi ;;
+  esac
+  local ip; ip=$(tunnel_exit_ip 8)
+  printf "%s│%s выход:  %s%s%s\n" "$CYA" "$R" "$YEL" "${ip:-—}" "$R"
+  printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+}
+
+vpn_status_one(){  # статус КОНКРЕТНОГО режима $1 (ovpn|pptp), метка $2
+  local t="$1" lbl="$2" cur; cur=$(active_exit)
+  printf "\n%s┌─ %s-выход ──────────────────────────────────%s\n" "$CYA" "$lbl" "$R"
+  exit_has "$t" && printf "%s│%s конфиг: задан\n" "$CYA" "$R" || printf "%s│%s конфиг: %sне задан%s\n" "$CYA" "$R" "$YEL" "$R"
+  if [ "$cur" = "$t" ]; then
+    printf "%s│%s режим:  %sактивен%s\n" "$CYA" "$R" "$GRN" "$R"
+    s2_exec "gate-vpn status 2>/dev/null" 2>/dev/null | while IFS= read -r l; do printf "%s│%s   %s\n" "$CYA" "$R" "$l"; done
+    local ip; ip=$(tunnel_exit_ip 8); printf "%s│%s выход:  %s%s%s\n" "$CYA" "$R" "$YEL" "${ip:-—}" "$R"
+  else
+    printf "%s│%s режим:  выключен\n" "$CYA" "$R"
+  fi
+  printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
+}
+
+vpn_test(){  # $1=ovpn|pptp — поднять интерфейс ИЗОЛИРОВАННО, curl через него, опустить
+  local t="$1"
+  exit_has "$t" || { echo "Нет $t-конфига. Сначала: gate $t set ..."; exit 1; }
+  [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ] && { echo "VPN-выход сейчас включён. Сначала gate exit off, потом test."; exit 1; }
+  echo "→ Проба $t-выхода (поднимаю интерфейс, текущий выход не трогаю)…"
+  local out ip
+  out=$(s2_exec "echo $t > $C2_VPN_DIR/type; gate-vpn up >/dev/null 2>&1
+dev=tun0; [ $t = pptp ] && dev=ppp0
+xip=\$(curl -s --interface \$dev --max-time 12 https://api.ipify.org 2>/dev/null)
+gate-vpn down >/dev/null 2>&1
+echo EXITIP=\$xip")
+  ip=$(printf '%s\n' "$out" | sed -n 's/^EXITIP=//p' | tr -d '\r')
+  if [ -n "$ip" ]; then
+    echo "  ${GRN}✓ $t работает${R}, выходной IP: ${YEL}$ip${R}"
+    local geo; geo=$(s2_exec "curl -s --max-time 10 http://ip-api.com/line/$ip?fields=country,regionName,city,isp 2>/dev/null")
+    [ -n "$geo" ] && echo "  гео: $(echo "$geo" | tr '\n' ' ')"
+  else
+    echo "  ${RED}✗ подключиться не вышло${R} (конфиг/сервер/креды; лог на C2: /var/log/gate-vpn.log)"
+  fi
+}
+
+cmd_ovpn(){
+  case "${1:-status}" in
+    set) shift; ovpn_set "$@" ;;
+    check) shift; ovpn_check "$@" ;;
+    test) vpn_test ovpn ;;
+    on)
+      exit_has ovpn || { echo "Нет OpenVPN-конфига. Сначала: gate ovpn set <файл.ovpn> [user] [pass]"; exit 1; }
+      ensure_exclusive ovpn || exit 0
+      vpn_on ovpn ;;
+    off) vpn_off ;;
+    status) vpn_status_one ovpn OpenVPN ;;
+    *) echo "gate ovpn {set <файл.ovpn> [user] [pass]|check <файл.ovpn>|test|on|off|status}" ;;
+  esac
+}
+cmd_pptp(){
+  case "${1:-status}" in
+    set) shift; pptp_set "$@" ;;
+    test) vpn_test pptp ;;
+    on)
+      exit_has pptp || { echo "Нет PPTP-конфига. Сначала: gate pptp set <server> <user> <pass>"; exit 1; }
+      ensure_exclusive pptp || exit 0
+      vpn_on pptp ;;
+    off) vpn_off ;;
+    status) vpn_status_one pptp PPTP ;;
+    *) echo "gate pptp {set <server> <user> <pass>|test|on|off|status}" ;;
+  esac
+}
+cmd_exit(){  # ЕДИНЫЙ статус/выключатель выхода — gate exit
+  case "${1:-status}" in
+    status|"") exit_status ;;
+    off) exit_off_one "$(active_exit)" ;;
+    *) echo "gate exit {status|off}" ;;
+  esac
+}
+
+# ─── Команда: logs ─ просмотр/вкл/выкл логирования ────────────────────
+# Флаги в /etc/gate/log.conf (TRAFFIC/PERF). Читает chain-render.py (traffic).
+log_flag(){  # $1=ключ, $2=дефолт(off); вернуть значение флага (on/off)
+  local v; v=$( { [ -f "$LOG_CONF" ] && grep -E "^$1=" "$LOG_CONF" 2>/dev/null | tail -1 | cut -d= -f2; } )
+  echo "${v:-${2:-off}}"
+}
+log_set(){   # записать KEY=VALUE в log.conf (создать/заменить)
+  sudo bash -c "
+    mkdir -p /etc/gate; touch '$LOG_CONF'
+    grep -v -E '^$1=' '$LOG_CONF' > '$LOG_CONF.tmp' 2>/dev/null || true
+    echo '$1=$2' >> '$LOG_CONF.tmp'
+    mv '$LOG_CONF.tmp' '$LOG_CONF'
+    chown pi:pi '$LOG_CONF'
+  "
+}
+# Перерендерить конфиг xray малины по текущим флагам и перезапустить
+render_pi_apply(){
+  local tmp; tmp="$(mktemp --suffix=.json)" || return 1
+  python3 "$RENDER" pi "$CHAIN_JSON" > "$tmp" || { echo "  ✗ рендер pi не удался"; rm -f "$tmp"; return 1; }
+  if command -v xray >/dev/null 2>&1; then
+    # как root: xray при -test реально открывает access/error-логи (root-владелец /var/log/xray)
+    sudo xray -test -config "$tmp" >/dev/null 2>&1 || { echo "  ✗ конфиг не прошёл xray -test"; rm -f "$tmp"; return 1; }
+  fi
+  sudo bash -c "cat '$tmp' > '$PI_XRAY_CONF'"; rm -f "$tmp"
+  sudo systemctl restart "$XRAY_SVC"; sleep 1
+}
+
+cmd_logs(){
+  local cat="${1:-status}"
+  case "$cat" in
+    xray)
+      case "${2:-view}" in
+        on)
+          echo "→ Системный лог xray: warning (ошибки/предупреждения в journald)…"
+          log_set XRAY on
+          render_pi_apply && echo "  ${GRN}✓${R} xray log ON (loglevel warning)"
+          ;;
+        off)
+          echo "→ Системный лог xray: полная тишина…"
+          log_set XRAY off
+          render_pi_apply && echo "  ${GRN}✓${R} xray log OFF (loglevel none)"
+          ;;
+        view) sudo journalctl -u "$XRAY_SVC" -n "${3:-50}" --no-pager ;;
+        status) echo "xray: $(log_flag XRAY on) (loglevel $(python3 -c "import json;print(json.load(open('$PI_XRAY_CONF'))['log']['loglevel'])" 2>/dev/null))" ;;
+        [0-9]*) sudo journalctl -u "$XRAY_SVC" -n "$2" --no-pager ;;   # back-compat: gate logs xray 50
+        *) echo "gate logs xray {view [N]|on|off|status}" ;;
+      esac
+      ;;
+    traffic)
+      case "${2:-view}" in
+        on)
+          echo "→ Включаю лог соединений (xray access log)…"
+          echo "  ${YEL}⚠ приватность:${R} будет видно, к каким адресам идут коннекты. Только для отладки."
+          sudo bash -c 'mkdir -p /var/log/xray'
+          log_set TRAFFIC on
+          render_pi_apply && echo "  ${GRN}✓${R} traffic ON → $XRAY_ACCESS"
+          ;;
+        off)
+          echo "→ Выключаю лог соединений…"
+          log_set TRAFFIC off
+          render_pi_apply && echo "  ${GRN}✓${R} traffic OFF (xray тихий: loglevel warning)"
+          ;;
+        view)
+          if sudo test -s "$XRAY_ACCESS"; then sudo tail -n "${3:-50}" "$XRAY_ACCESS"
+          else echo "Лог соединений пуст/выключен. Включить: gate logs traffic on"; fi
+          ;;
+        status) echo "traffic: $(log_flag TRAFFIC)";;
+        *) echo "gate logs traffic {on|off|view|status}";;
+      esac
+      ;;
+    perf)
+      case "${2:-view}" in
+        on)
+          echo "→ Включаю мониторинг (CPU/RAM/темп/потери к C1, каждые 30с)…"
+          log_set PERF on
+          sudo systemctl enable --now "$PERF_SVC" >/dev/null 2>&1
+          systemctl is-active --quiet "$PERF_SVC" \
+            && echo "  ${GRN}✓${R} perf ON → $PERF_LOG" || echo "  ${RED}✗${R} служба не стартовала"
+          ;;
+        off)
+          echo "→ Выключаю мониторинг…"
+          log_set PERF off
+          sudo systemctl disable --now "$PERF_SVC" >/dev/null 2>&1
+          echo "  ${GRN}✓${R} perf OFF"
+          ;;
+        view)
+          if [ -s "$PERF_LOG" ]; then tail -n "${3:-20}" "$PERF_LOG"
+          else echo "Лог производительности пуст/выключен. Включить: gate logs perf on"; fi
+          ;;
+        status) echo "perf: $(log_flag PERF)  (служба: $(systemctl is-active "$PERF_SVC" 2>/dev/null))";;
+        *) echo "gate logs perf {on|off|view|status}";;
+      esac
+      ;;
+    off)
+      cmd_logs traffic off
+      cmd_logs perf off
+      echo "${B}Тихий режим:${R} всё опциональное логирование выключено (бережём SD-карту)."
+      ;;
+    status|"")
+      printf "%sЛогирование%s (тихо = бережём SD-карту)\n" "$B" "$R"
+      printf "  traffic (соединения): %s%s%s  → %s\n" "$B" "$(log_flag TRAFFIC)" "$R" "$XRAY_ACCESS"
+      printf "  perf (CPU/RAM/темп):  %s%s%s  → %s  [служба: %s]\n" "$B" "$(log_flag PERF)" "$R" "$PERF_LOG" "$(systemctl is-active "$PERF_SVC" 2>/dev/null)"
+      printf "  xray (журнал):        %s%s%s  journald — смотреть: gate logs xray [N]\n" "$B" "$(log_flag XRAY on)" "$R"
+      [ -f "$PERF_LOG" ] && printf "  размер perf-лога:     %s\n" "$(du -h "$PERF_LOG" 2>/dev/null | cut -f1)"
+      sudo test -f "$XRAY_ACCESS" && printf "  размер access-лога:   %s\n" "$(sudo du -h "$XRAY_ACCESS" 2>/dev/null | cut -f1)"
+      ;;
+    *) echo "gate logs {status|xray [N]|traffic {on|off|view}|perf {on|off|view}|off}";;
+  esac
+}
+
+# ─── Команда: profile ─ именованные профили носков/VPN ────────────────
+# Хранятся НА малине (root-only, umask 077):
+#   socks/<имя>.conf  (как socks.conf)   • pptp/<имя>.conf   • ovpn/<имя>/{client.ovpn,auth.txt}
+# «use» переиспользует существующие сеттеры (cmd_socks set / pptp_set / ovpn_set):
+# для ovpn это перезаливает .ovpn на C2 БЕЗ повторной ручной загрузки файла.
+prof_name_ok(){ case "$1" in ''|*[!A-Za-z0-9._-]*) return 1;; *) return 0;; esac; }
+
+profile_list(){
+  local types="${1:-socks pptp ovpn}" t d n
+  for t in $types; do
+    d="$PROFILE_DIR/$t"
+    printf "%s%s%s:\n" "$B" "$t" "$R"
+    n=""
+    if sudo test -d "$d"; then
+      case "$t" in
+        ovpn) n="$(sudo ls -1 "$d" 2>/dev/null)";;
+        *)    n="$(sudo ls -1 "$d" 2>/dev/null | sed 's/\.conf$//')";;
+      esac
+    fi
+    if [ -n "$n" ]; then echo "$n" | sed 's/^/  /'; else echo "  ${D}(пусто)${R}"; fi
+  done
+}
+
+profile_save(){
+  local t="${1:-}" name="${2:-}"; shift 2 2>/dev/null || true
+  prof_name_ok "$name" || { echo "Использование: gate profile save <socks|pptp|ovpn> <имя> ...  (имя: A-Za-z0-9._-)"; exit 1; }
+  case "$t" in
+    socks)
+      local ip="${1:-}" port="${2:-}" user="${3:-}" pass="${4:-}"
+      [ -n "$ip" ] && [ -n "$port" ] || { echo "gate profile save socks <имя> <ip> <port> [user] [pass]"; exit 1; }
+      sudo mkdir -p "$PROFILE_DIR/socks"
+      sudo bash -c "umask 077; cat > '$PROFILE_DIR/socks/$name.conf' <<EOF
+SOCKS_IP=$ip
+SOCKS_PORT=$port
+SOCKS_USER=$user
+SOCKS_PASS=$pass
+EOF"
+      echo "Профиль носка ${B}$name${R} сохранён.  Применить: gate profile use socks $name"
+      ;;
+    pptp)
+      local srv="${1:-}" user="${2:-}" pass="${3:-}"
+      [ -n "$srv" ] && [ -n "$user" ] && [ -n "$pass" ] || { echo "gate profile save pptp <имя> <server> <user> <pass>"; exit 1; }
+      sudo mkdir -p "$PROFILE_DIR/pptp"
+      sudo bash -c "umask 077; cat > '$PROFILE_DIR/pptp/$name.conf' <<EOF
+PPTP_SERVER=$srv
+PPTP_USER=$user
+PPTP_PASS=$pass
+EOF"
+      echo "Профиль PPTP ${B}$name${R} сохранён.  Применить: gate profile use pptp $name"
+      ;;
+    ovpn)
+      local f="${1:-}" user="${2:-}" pass="${3:-}"
+      [ -f "$f" ] || { echo "Файл не найден: $f  (укажи путь к .ovpn на малине)"; exit 1; }
+      sudo mkdir -p "$PROFILE_DIR/ovpn/$name"
+      sudo bash -c "umask 077; cat '$f' > '$PROFILE_DIR/ovpn/$name/client.ovpn'"
+      if [ -n "$user" ]; then
+        sudo bash -c "umask 077; printf '%s\n%s\n' '$user' '$pass' > '$PROFILE_DIR/ovpn/$name/auth.txt'"
+      else
+        sudo rm -f "$PROFILE_DIR/ovpn/$name/auth.txt"
+      fi
+      echo "Профиль OpenVPN ${B}$name${R} сохранён (.ovpn скопирован — заново грузить не нужно)."
+      echo "Применить: gate profile use ovpn $name"
+      ;;
+    *) echo "Тип: socks|pptp|ovpn"; exit 1 ;;
+  esac
+}
+
+profile_use(){
+  local t="${1:-}" name="${2:-}"
+  prof_name_ok "$name" || { echo "Использование: gate profile use <socks|pptp|ovpn> <имя>"; exit 1; }
+  case "$t" in
+    socks)
+      local p="$PROFILE_DIR/socks/$name.conf"
+      sudo test -f "$p" || { echo "Нет профиля носка '$name'  (список: gate profile list socks)"; exit 1; }
+      local SOCKS_IP="" SOCKS_PORT="" SOCKS_USER="" SOCKS_PASS=""
+      eval "$(sudo cat "$p")"
+      cmd_socks set "$SOCKS_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS"
+      ;;
+    pptp)
+      local p="$PROFILE_DIR/pptp/$name.conf"
+      sudo test -f "$p" || { echo "Нет профиля PPTP '$name'  (список: gate profile list pptp)"; exit 1; }
+      local PPTP_SERVER="" PPTP_USER="" PPTP_PASS=""
+      eval "$(sudo cat "$p")"
+      pptp_set "$PPTP_SERVER" "$PPTP_USER" "$PPTP_PASS"
+      ;;
+    ovpn)
+      local d="$PROFILE_DIR/ovpn/$name"
+      sudo test -f "$d/client.ovpn" || { echo "Нет профиля OpenVPN '$name'  (список: gate profile list ovpn)"; exit 1; }
+      local u="" pw=""
+      if sudo test -f "$d/auth.txt"; then
+        u="$(sudo sed -n 1p "$d/auth.txt")"; pw="$(sudo sed -n 2p "$d/auth.txt")"
+      fi
+      ovpn_set "$d/client.ovpn" "$u" "$pw"
+      ;;
+    *) echo "gate profile use <socks|pptp|ovpn> <имя>"; exit 1 ;;
+  esac
+}
+
+profile_rm(){
+  local t="${1:-}" name="${2:-}"
+  prof_name_ok "$name" || { echo "Использование: gate profile rm <socks|pptp|ovpn> <имя>"; exit 1; }
+  case "$t" in
+    socks) sudo rm -f  "$PROFILE_DIR/socks/$name.conf" ;;
+    pptp)  sudo rm -f  "$PROFILE_DIR/pptp/$name.conf" ;;
+    ovpn)  sudo rm -rf "$PROFILE_DIR/ovpn/$name" ;;
+    *) echo "gate profile rm <socks|pptp|ovpn> <имя>"; exit 1 ;;
+  esac
+  echo "Профиль $t/$name удалён."
+}
+
+cmd_profile(){
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls)        profile_list "$@" ;;
+    save|add)       profile_save "$@" ;;
+    use|load)       profile_use "$@" ;;
+    rm|del|delete)  profile_rm "$@" ;;
+    *) echo "gate profile {list [тип] | save <тип> <имя> ... | use <тип> <имя> | rm <тип> <имя>}";;
+  esac
+}
+
+# ─── Команда: wipe ─ очистка профилей/стейта на малине + кред на C2 ───
+cmd_wipe(){
+  if [ "${GATE_YES:-0}" != "1" ]; then
+    printf "%s⚠ Очистка%s удалит: ВСЕ профили, текущий носок/VPN-конфиг на малине и затрёт креды/конфиги VPN на C2.\n" "$YEL" "$R"
+    printf "Для подтверждения набери %swipe%s: " "$B" "$R"
+    local ans=""; read -r ans
+    [ "$ans" = "wipe" ] || { echo "Отменено."; exit 0; }
+  fi
+  echo "→ Выключаю активный выход (fail-safe → прямой режим)…"
+  local act; act="$(active_exit 2>/dev/null)"; [ -n "$act" ] && exit_off_one "$act" 2>/dev/null || true
+  echo "→ Чищу профили и конфиги на малине…"
+  sudo rm -rf "$PROFILE_DIR"
+  sudo rm -f "$SOCKS_CONF" "$SOCKS_CAPS" "$VPN_META" /etc/gate/vpn-dns
+  echo "→ Затираю креды/конфиги VPN на выходном хопе (C2, через цепочку)…"
+  if s2_exec "rm -rf '$C2_VPN_DIR'/client.ovpn '$C2_VPN_DIR'/auth.txt '$C2_VPN_DIR'/pushed-dns /etc/ppp/peers/gate-vpn; sed -i '/ gate-pptp /d' /etc/ppp/chap-secrets 2>/dev/null; echo WIPED" 2>/dev/null | grep -q WIPED; then
+    echo "  ${GRN}✓${R} C2 очищен"
+  else
+    echo "  ${YEL}⚠${R} C2 недоступен — удалённую часть пропустил (повтори при живой цепочке)"
+  fi
+  echo "${GRN}✓${R} Готово. Малина в прямом режиме, профили пусты."
+}
+
+# ─── Команда: web ─ локальная веб-панель (LAN-only, пароль) ───────────
+WEB_PY="/usr/local/bin/gate-web.py"
+# Самодостаточность: на любой малине, куда долили gate+gate-web.py, «gate web on»
+# сам доставит systemd-юнит (если нет) и заведёт удобное имя http://gate в dnsmasq.
+web_ensure_installed(){
+  if ! sudo test -f /etc/systemd/system/gate-web.service; then
+    sudo bash -c 'cat > /etc/systemd/system/gate-web.service <<UNIT
+[Unit]
+Description=gate — локальная веб-панель управления (LAN-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/gate-web.py serve
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT'
+    sudo systemctl daemon-reload
+  fi
+  # http://gate → AP-адрес малины (отдельный файл, чтобы не трогать managed gate.conf)
+  local apaddr="${AP_ADDR:-192.168.50.1}" dconf=/etc/dnsmasq.d/gate-web.conf
+  if ! sudo test -f "$dconf" || ! sudo grep -q '^address=/gate/' "$dconf" 2>/dev/null; then
+    echo "address=/gate/$apaddr" | sudo tee "$dconf" >/dev/null
+    sudo systemctl restart dnsmasq 2>/dev/null || true
+  fi
+}
+cmd_web(){
+  case "${1:-status}" in
+    passwd|password)
+      local pw="${2:-}"
+      if [ -z "$pw" ]; then
+        read -rsp "Новый пароль веб-панели: " pw; echo
+        local pw2; read -rsp "Повтори пароль: " pw2; echo
+        [ "$pw" = "$pw2" ] || { echo "${RED}Пароли не совпали${R}"; exit 1; }
+      fi
+      [ -n "$pw" ] || { echo "Пустой пароль"; exit 1; }
+      printf '%s' "$pw" | sudo python3 "$WEB_PY" passwd-stdin || exit 1
+      echo "Включить панель: gate web on"
+      ;;
+    on)
+      if ! sudo test -f /etc/gate/web.conf || ! sudo grep -q '^PASS_HASH=' /etc/gate/web.conf 2>/dev/null; then
+        echo "${YEL}Сначала задай пароль:${R} gate web passwd"; exit 1
+      fi
+      web_ensure_installed
+      sudo systemctl enable --now gate-web >/dev/null 2>&1
+      if systemctl is-active --quiet gate-web; then
+        local port; port="$(sudo grep -E '^PORT=' /etc/gate/web.conf 2>/dev/null | cut -d= -f2)"; port="${port:-8088}"
+        echo "${GRN}✓${R} Панель включена: ${B}http://gate:$port${R} (или http://192.168.50.1:$port) — только из локалки"
+      else
+        echo "${RED}✗${R} служба не стартовала — смотри: gate web log"
+      fi
+      ;;
+    off)
+      sudo systemctl disable --now gate-web >/dev/null 2>&1
+      echo "${GRN}✓${R} Панель выключена."
+      ;;
+    restart) sudo systemctl restart gate-web && echo "${GRN}✓${R} перезапущена" ;;
+    log)     sudo journalctl -u gate-web -n "${2:-30}" --no-pager ;;
+    status|"")
+      local act port
+      act="$(systemctl is-active gate-web 2>/dev/null)"
+      port="$(sudo grep -E '^PORT=' /etc/gate/web.conf 2>/dev/null | cut -d= -f2)"; port="${port:-8088}"
+      printf "Веб-панель: %s%s%s" "$B" "$act" "$R"
+      sudo grep -q '^PASS_HASH=' /etc/gate/web.conf 2>/dev/null && printf "  (пароль задан)" || printf "  ${YEL}(пароль НЕ задан)${R}"
+      printf "\n  адрес: http://gate:%s  •  http://192.168.50.1:%s  (LAN-only)\n" "$port" "$port"
+      ;;
+    *) echo "gate web {passwd [пароль]|on|off|restart|status|log [N]}" ;;
+  esac
+}
+
+cmd_help(){
+  # h = заголовок секции, c = команда, описание после неё
+  local h="${CYA}${B}" g="${GRN}" hr="${CYA}"
+  cat <<EOF
+
+  ${B}gate${R} ${D}v${GATE_VERSION} — управление privacy-роутером (TPROXY → reality → C1 → C2)${R}
+  ${D}алиасы команд показаны серым в ⟨скобках⟩${R}
+
+${hr}━━ ОБЗОР ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${g}gate info${R}                    полный статус роутера
+  ${g}gate clients${R}                 устройства в раздаче
+  ${g}gate traffic [iface]${R}         живой трафик ↓↑ до Ctrl+C
+
+${hr}━━ ВЫХОД В ИНТЕРНЕТ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${D}как цепочка выходит наружу с C2. режимы взаимоисключающи.${R}
+  ${g}gate exit${R}                    ЕДИНЫЙ статус выхода (режим / iface / IP)
+  ${g}gate exit off${R}                выключить активный → прямой выход C2
+  ${g}gate dns [N]${R}                 проба DNS-утечки: чей резолвер видит мир
+  ${g}gate dns fallback on|off${R}     запасной DNS (CF+Google), если туннель свой не дал
+  ${g}gate dns resolver cf|quad9${R}   резолвер малины для ПРЯМОГО выхода
+  ${g}gate osfp on [apple|windows|linux]${R}  подмена OS-отпечатка (только с VPN-выходом)
+  ${g}gate osfp off|status${R}         выключить / статус подмены OS
+
+  ${B}носок (SOCKS5):${R}
+  ${g}gate socks set <ip> <port> [user] [pass]${R}   задать носок
+  ${g}gate socks test${R}              проба: TCP / remote-DNS / UDP
+  ${g}gate socks on|off|status${R}     вкл (адаптивно) / выкл / статус
+
+  ${B}OpenVPN:${R}
+  ${g}gate ovpn set <файл.ovpn> [user] [pass]${R}    задать (залить .ovpn)
+  ${g}gate ovpn check <файл.ovpn>${R}    проверить конфиг на совместимость + советы
+  ${g}gate ovpn test|on|off|status${R} проба / вкл / выкл / статус
+
+  ${B}PPTP:${R} ${YEL}⚠ крипта слабая${R}
+  ${g}gate pptp set <server> <user> <pass>${R}       задать
+  ${g}gate pptp test|on|off|status${R} проба / вкл / выкл / статус
+  ${D}при «on» активный другой режим спросит про переключение (-y / --yes — без вопроса)${R}
+
+  ${B}профили (запомнить носки/VPN, не вводить заново):${R}
+  ${g}gate profile list [тип]${R}      что сохранено (socks/pptp/ovpn)
+  ${g}gate profile save socks <имя> <ip> <port> [user] [pass]${R}
+  ${g}gate profile save pptp <имя> <server> <user> <pass>${R}
+  ${g}gate profile save ovpn <имя> <файл.ovpn> [user] [pass]${R}  ${D}(копирует .ovpn)${R}
+  ${g}gate profile use <тип> <имя>${R}  активировать сохранённый
+  ${g}gate profile rm  <тип> <имя>${R}  удалить профиль
+  ${g}gate wipe${R}                    очистка: все профили + стейт + креды на C2 ${D}(-y без вопроса)${R}
+
+${hr}━━ ВЕБ-ПАНЕЛЬ (управление из локалки) ━━━━━━━━━━━━━━━━${R}
+  ${D}морда доступна только из LAN, под паролем: http://gate:8088${R}
+  ${g}gate web passwd${R}              задать/сменить пароль панели
+  ${g}gate web on|off|restart${R}      включить / выключить / перезапустить
+  ${g}gate web status|log${R}          состояние / журнал
+
+${hr}━━ ТУННЕЛЬ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${g}gate tunnel up|down|restart${R}  поднять / опустить / пересобрать
+  ${g}gate tunnel status${R}           состояние перехвата
+
+${hr}━━ ЦЕПОЧКА (C1/C2/C3) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${g}gate setup${R}                   визард: развернуть/пересобрать
+  ${g}gate setup redeploy${R}          перелить конфиги по chain.json
+  ${g}gate setup show${R}              показать цепочку ${D}⟨= gate chain⟩${R}
+
+${hr}━━ WAN — как малина в инете ━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${g}gate wan${R}                     текущий источник WAN
+  ${g}gate wan eth|wifi|auto${R}       Ethernet / встроенный Wi-Fi / авто
+
+  ${g}gate eth${R}                     статус eth0 (link / IP / MAC)
+  ${g}gate eth mac${R} ${D}[random|aa:bb:cc:dd:ee:ff|reset]${R}  MAC eth0
+
+  ${g}gate wifi${R}                    статус встроенного Wi-Fi (wlan0)
+  ${g}gate wifi connect "SSID" [пароль]${R}  подключиться к сети
+  ${g}gate wifi scan${R}               список доступных сетей
+  ${g}gate wifi disconnect${R}         выключить встроенный Wi-Fi
+  ${g}gate wifi mac${R} ${D}[random|aa:bb:cc:dd:ee:ff|reset]${R}  MAC wlan0
+
+${hr}━━ РАЗДАЧА (AP для устройств) ━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${g}gate ap${R}                      статус (SSID / MAC / клиенты)
+  ${g}gate ap on|off|restart${R}       вкл / выкл / перезапуск
+  ${g}gate ap ssid "Имя"${R} ${B}|${R} ${g}ap pass "пароль"${R}   сменить SSID / пароль
+  ${g}gate ap mac${R} ${D}[random|aa:bb:cc:dd:ee:ff|reset]${R}  MAC адаптера ${D}(одинаково у eth/wifi/ap)${R}
+
+${hr}━━ ЛОГИ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
+  ${D}по умолчанию всё тихо (бережём SD)${R}
+  ${g}gate logs${R}                    что включено + размеры
+  ${g}gate logs xray [N]${R}           N строк журнала xray
+  ${g}gate logs xray on|off${R}        системный лог: warning ↔ тишина
+  ${g}gate logs traffic on|off|view${R}  лог соединений
+  ${g}gate logs perf on|off|view${R}   CPU / RAM / темп / потери к C1
+  ${g}gate logs off${R}                выключить traffic+perf
+
+EOF
+}
+
+# ─── Роутинг ──────────────────────────────────────────────────────────
+# -y / --yes в любом месте → авто-подтверждение переключения exit-режима
+GATE_YES=0; _args=()
+for _a in "$@"; do case "$_a" in -y|--yes) GATE_YES=1 ;; *) _args+=("$_a") ;; esac; done
+set -- "${_args[@]}"
+
+case "${1:-help}" in
+  info) cmd_info ;;
+  wan)  shift; cmd_wan "$@" ;;
+  eth)  shift; cmd_eth "$@" ;;
+  wifi) shift; cmd_wifi "$@" ;;
+  ap)   shift; cmd_ap "$@" ;;
+  clients) cmd_clients ;;
+  traffic) shift; cmd_traffic "$@" ;;
+  tunnel) shift; cmd_tunnel "$@" ;;
+  socks) shift; cmd_socks "$@" ;;
+  ovpn)  shift; cmd_ovpn "$@" ;;
+  pptp)  shift; cmd_pptp "$@" ;;
+  profile) shift; cmd_profile "$@" ;;
+  wipe)  cmd_wipe ;;
+  web)   shift; cmd_web "$@" ;;
+  exit)  shift; cmd_exit "$@" ;;
+  dns)   shift; cmd_dns "$@" ;;
+  osfp)  shift; cmd_osfp "$@" ;;
+  setup) shift; exec /usr/local/bin/gate-setup "$@" ;;
+  chain) exec /usr/local/bin/gate-setup show ;;
+  logs) shift; cmd_logs "$@" ;;
+  --version|-V|version) echo "gate $GATE_VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *) echo "Неизвестная команда: $1"; echo; cmd_help; exit 1 ;;
+esac

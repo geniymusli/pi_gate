@@ -1,0 +1,16 @@
+[Unit]
+Description=gate — локальная веб-панель управления (LAN-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/gate-web.py serve
+Restart=on-failure
+RestartSec=3
+# нужен root: gate внутри использует sudo (iptables, render, ssh-цепочка)
+User=root
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

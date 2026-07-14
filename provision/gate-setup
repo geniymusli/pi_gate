@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+#
+# gate-setup — визард развёртывания цепочки с малины.
+# Спрашивает хопы (C1/C2/…/выход), сам ставит xray на каждый VPS, генерит
+# ключи Reality, рендерит и разворачивает конфиги по всей цепочке, настраивает
+# малину и проверяет выход. Модель управления: ВЛОЖЕННАЯ, ключи-на-хопах —
+# малина→C1 ключом малины, C1→C2 ключом C1, C2→C3 ключом C2. Ключ малины
+# попадает ТОЛЬКО на C1. На каждый следующий VPS при создании добавляешь ключ
+# ПРЕДЫДУЩЕГО хопа (визард его показывает), и хоп ставится вложенно через предыдущий.
+#
+#   gate setup            — интерактивно (новая цепочка / пересборка / добавить хоп)
+#   gate setup redeploy   — перерендерить и разлить текущий chain.json (без вопросов)
+#   gate setup show       — показать цепочку (без секретов)
+#
+set -uo pipefail
+
+MGMT_KEY="${MGMT_KEY:-$HOME/.ssh/gate_to_s1}"
+CHAIN_JSON="${CHAIN_JSON:-/etc/gate/chain.json}"
+RENDER="${RENDER:-/usr/local/bin/chain-render.py}"
+BOOTSTRAP="${BOOTSTRAP:-/usr/local/share/gate/vps-bootstrap.sh}"
+# Пиннованный amd64-бинарь xray для серверов — стейджится на хоп ПЕРЕД bootstrap'ом,
+# чтобы сервер (в т.ч. в РФ, без GitHub) ставил xray из него, а не тянул из инета.
+XRAY_BIN="${XRAY_BIN:-/usr/local/share/gate/xray-linux-amd64}"
+XRAY_BIN_REMOTE="/tmp/gate-xray.bin"
+PI_XRAY_CONF="/usr/local/etc/xray/config.json"
+SSH_USER="${SSH_USER:-root}"
+SSH_PORT="${SSH_PORT:-22}"
+
+if [ -t 1 ]; then
+  B=$'\e[1m'; R=$'\e[0m'; G=$'\e[32m'; Y=$'\e[33m'; RED=$'\e[31m'; C=$'\e[36m'; D=$'\e[2m'
+else B=""; R=""; G=""; Y=""; RED=""; C=""; D=""; fi
+say(){ printf "%s\n" "$*"; }
+hd(){ printf "\n%s── %s ──%s\n" "$C" "$*" "$R"; }
+ok(){ printf "  %s✓%s %s\n" "$G" "$R" "$*"; }
+warn(){ printf "  %s!%s %s\n" "$Y" "$R" "$*"; }
+err(){ printf "  %s✗%s %s\n" "$RED" "$R" "$*"; }
+die(){ err "$*"; exit 1; }
+ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "$p [$d]: " a; echo "${a:-$d}"; else read -rp "$p: " a; echo "$a"; fi; }
+yes(){ local a; read -rp "$1 [y/N]: " a; [[ "$a" =~ ^[yYдД] ]]; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || die "нет $1"; }
+
+# ── SSH-доступ ────────────────────────────────────────────────────────
+hop_host(){ python3 "$RENDER" host "$CHAIN_JSON" "$1"; }
+DSSHO=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+
+# ПРЯМОЙ доступ ключом малины — для провижининга СВЕЖИХ VPS (ключ малины ты
+# добавляешь в root@authorized_keys при создании, :22 ещё открыт).
+dssh(){ local h="$1"; shift; ssh -i "$MGMT_KEY" "${DSSHO[@]}" "$SSH_USER@$h" "$@"; }
+dscp(){ scp -i "$MGMT_KEY" "${DSSHO[@]}" "$1" "$SSH_USER@$2:$3"; }
+
+# ВЛОЖЕННЫЙ доступ к хопу i (ключи-на-хопах: Pi→C1 ключом малины, C1→C2 ключом
+# C1, …) — для уже ЗАПЕРТЫХ хопов (redeploy/управление). payload как аргумент,
+# stdin вызова прокидывается до самой внутренней команды (для деплоя конфига).
+nrun(){
+  local i="$1" payload="$2" full
+  full="$(printf '%s' "$payload" | python3 "$RENDER" node-cmd "$CHAIN_JSON" "$i" 2>/dev/null)" || return 1
+  [ -n "$full" ] || return 1
+  bash -c "$full"
+}
+
+# выполнить cmd на хопе i, выбирая доступ: hop0 — прямой (ключ малины), глубже —
+# вложенный (ключи-на-хопах). stdin прокидывается до самой внутренней команды
+# (для bash -s / cat > файла).
+on_hop(){
+  local i="$1" cmd="$2"
+  if [ "$i" -eq 0 ]; then dssh "$(hop_host 0)" "$cmd"; else nrun "$i" "$cmd"; fi
+}
+hop_reachable(){ on_hop "$1" true >/dev/null 2>&1; }
+
+# ── генерация идентичности линка ──────────────────────────────────────
+gen_uuid(){ xray uuid; }
+gen_shortid(){ od -An -tx1 -N4 /dev/urandom | tr -d ' \n'; }
+gen_keypair(){ # печатает "priv pub"
+  local out priv pub
+  out="$(xray x25519)"
+  priv="$(printf '%s\n' "$out" | grep -iE 'private' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')"
+  pub="$(printf '%s\n' "$out" | grep -iE 'public'  | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')"
+  [ -n "$priv" ] && [ -n "$pub" ] || die "не разобрал вывод xray x25519"
+  printf '%s %s' "$priv" "$pub"
+}
+
+# ── управляющий ключ малины (только до C1) ────────────────────────────
+ensure_mgmt_key(){
+  if [ ! -f "$MGMT_KEY" ]; then
+    hd "Управляющий ключ малины"
+    say "Создаю $MGMT_KEY (ed25519) — им малина ходит к ПЕРВОМУ хопу (C1)."
+    ssh-keygen -t ed25519 -N "" -f "$MGMT_KEY" -C "gate-mgmt@$(hostname)" >/dev/null
+    ok "ключ создан"
+  fi
+}
+
+# показать публичный ключ и дождаться, пока пользователь добавит его на VPS
+reveal_and_wait(){
+  local pub="$1" target="$2" what="$3"
+  printf "\n%s┌─ Добавь %s в root@authorized_keys на %s ─%s\n" "$C" "$what" "$target" "$R"
+  printf "%s│%s при создании VPS (поле SSH-ключа) или в веб-консоли провайдера:\n" "$C" "$R"
+  printf "%s%s%s\n" "$Y" "$pub" "$R"
+  printf "%s└────────────────────────────────────────────────%s\n" "$C" "$R"
+  read -rp "Когда ключ добавлен и VPS доступен — нажми Enter: " _a
+}
+
+# ── чтение значения хопа из текущего chain.json (для переиспользования ключей) ──
+old_hop_field(){ # host field -> value (пусто если нет)
+  [ -f "$CHAIN_JSON" ] || return 0
+  sudo cat "$CHAIN_JSON" 2>/dev/null | python3 -c "
+import json,sys
+try: c=json.load(sys.stdin)
+except: sys.exit(0)
+for h in c.get('hops',[]):
+    if h.get('host')=='$1': print(h.get('$2','')); break
+" 2>/dev/null
+}
+
+# ── записать chain.json (через stdin собранного python) ───────────────
+write_chain(){ # читает JSON из stdin, кладёт в CHAIN_JSON как pi:pi 600
+  local tmp; tmp="$(mktemp)"; cat > "$tmp"
+  python3 -c "import json,sys;json.load(open('$tmp'))" || die "собранный chain.json невалиден"
+  sudo bash -c "mkdir -p $(dirname "$CHAIN_JSON"); cat '$tmp' > '$CHAIN_JSON'; chown $(id -un):$(id -gn) '$CHAIN_JSON'; chmod 600 '$CHAIN_JSON'"
+  rm -f "$tmp"
+}
+
+# ── записать next_key для хопа i в chain.json ──────────────────────────
+set_next_key(){
+  local i="$1" path="$2" tmp; tmp="$(mktemp)"
+  python3 -c "
+import json
+c=json.load(open('$CHAIN_JSON')); c['hops'][$i]['next_key']='$path'
+json.dump(c,open('$tmp','w'),indent=2)
+"
+  sudo bash -c "cat '$tmp' > '$CHAIN_JSON'; chown $(id -un):$(id -gn) '$CHAIN_JSON'; chmod 600 '$CHAIN_JSON'"
+  rm -f "$tmp"
+}
+
+# ── доставить amd64-бинарь xray на хоп i (gzip+base64 по цепочке) ───────
+# Кладём во временный $XRAY_BIN_REMOTE; bootstrap ставит из него без GitHub.
+# gzip режет ~40% (xray ~37МБ → ~13МБ) — заметно быстрее по вложенному SSH.
+stage_xray_bin(){
+  local i="$1"
+  [ -f "$XRAY_BIN" ] || { warn "нет $XRAY_BIN на малине — сервер будет ставить xray с GitHub (нужен инет на хопе)"; return 0; }
+  say "  • доставляю бинарь xray ($(du -h "$XRAY_BIN" | cut -f1)) на хоп…"
+  gzip -c "$XRAY_BIN" | base64 -w0 \
+    | on_hop "$i" "base64 -d | gunzip > $XRAY_BIN_REMOTE && chmod 644 $XRAY_BIN_REMOTE && echo '    ✓ xray доставлен'" \
+    || warn "не доставил бинарь xray — bootstrap уйдёт в GitHub-фоллбэк"
+}
+
+# ── bootstrap хопа i (xray/BBR/ufw/ssh) — пайпом, доступом по роли ──────
+bootstrap_hop(){
+  stage_xray_bin "$1"
+  say "  • bootstrap (xray/BBR/ufw/ssh)…"
+  on_hop "$1" "XRAY_BIN=$XRAY_BIN_REMOTE bash -s" < "$BOOTSTRAP" | sed 's/^/    /' || die "bootstrap упал"
+}
+
+# ── деплой конфига на хоп i (рендер + cat>файл + xray -test + рестарт) ──
+# Доступ выбирается по роли (hop0 прямой, глубже вложенный) — годится и для
+# первичной установки, и для redeploy уже запертых хопов.
+deploy_config(){
+  local i="$1" role tmp; role="$(python3 "$RENDER" role "$CHAIN_JSON" "$i")"
+  say "  • деплой конфига ($role)…"
+  tmp="$(mktemp --suffix=.json)"; python3 "$RENDER" node "$CHAIN_JSON" "$i" > "$tmp" || die "рендер"
+  on_hop "$i" "cat > $PI_XRAY_CONF && xray -test -config $PI_XRAY_CONF >/dev/null 2>&1 && systemctl restart xray && sleep 1 && systemctl is-active xray" < "$tmp" \
+    | sed 's/^/    xray: /'
+  rm -f "$tmp"
+}
+push_config(){ deploy_config "$1"; }   # алиас для redeploy
+
+# ── доставить C2-side хелперы на ВЫХОДНОЙ хоп (gate-vpn, gate-osfp[.py]) ──
+# Чтобы после setup СРАЗУ работали gate pptp/ovpn/osfp (вкл. status/off) без ленивых
+# дозаливок при первом `on`. Иначе на свежем/переустановленном выходе их нет → status врёт.
+deploy_exit_helpers(){
+  local i="$1" src dst pair
+  say "  • C2-side хелперы (gate-vpn / gate-osfp)…"
+  for pair in "gate-vpn:/usr/local/bin/gate-vpn" \
+              "gate-osfp:/usr/local/bin/gate-osfp" \
+              "gate-osfp.py:/usr/local/bin/gate-osfp.py"; do
+    src="/usr/local/share/gate/${pair%%:*}"; dst="${pair##*:}"
+    [ -f "$src" ] || { warn "нет $src на малине — пропускаю"; continue; }
+    base64 -w0 "$src" | on_hop "$i" "base64 -d > $dst && chmod 755 $dst && echo '    ✓ ${pair##*:}'" \
+      || warn "не доставил $dst"
+  done
+}
+
+# ── сгенерить линк-ключ hop[i]→hop[i+1]: приватный кладём НА hop[i], ────
+# публичный возвращаем в NEXT_PUB (его добавишь на hop[i+1] при создании).
+NEXT_PUB=""
+make_link_key(){
+  local i="$1" keypath tmpk
+  keypath="/root/.ssh/gate_to_hop$((i+1))"
+  tmpk="$(mktemp -u)"; ssh-keygen -t ed25519 -N "" -f "$tmpk" -C "gate-hop$i-to-hop$((i+1))" >/dev/null
+  on_hop "$i" "umask 077; mkdir -p /root/.ssh; cat > $keypath; chmod 600 $keypath" < "$tmpk" \
+    || die "не положить приватный линк-ключ на hop$i"
+  NEXT_PUB="$(cat "$tmpk.pub")"
+  rm -f "$tmpk" "$tmpk.pub"
+  set_next_key "$i" "$keypath"
+  ok "линк-ключ hop$i→hop$((i+1)) положен на hop$i ($keypath)"
+}
+
+# ── запереть :22 хопа i на предыдущий узел (data plane :443 — миру) ─────
+lock_hop(){
+  # :22 запираем на ИСХОДЯЩИЙ IP предыдущего хопа (send_through, если задан, иначе host) —
+  # именно с него идёт управляющий SSH (node_cmd добавляет ssh -b). Так следующий хоп не
+  # видит входной IP предыдущего.
+  local i="$1" prev; prev="$(python3 "$RENDER" egress-host "$CHAIN_JSON" $((i-1)))"
+  on_hop "$i" "ufw delete allow $SSH_PORT/tcp >/dev/null 2>&1; ufw allow from $prev to any port $SSH_PORT proto tcp >/dev/null 2>&1; ufw reload >/dev/null 2>&1" \
+    && ok "hop$i :22 заперт на $prev (доступ только через него)" \
+    || warn "не удалось запереть :22 на hop$i — проверь ufw вручную"
+}
+
+# ── настроить малину ──────────────────────────────────────────────────
+deploy_pi(){
+  hd "Малина (entry)"
+  local tmp; tmp="$(mktemp --suffix=.json)"   # .json обязателен: xray берёт формат из расширения
+  python3 "$RENDER" pi "$CHAIN_JSON" > "$tmp" || die "рендер pi"
+  xray -test -config "$tmp" >/dev/null 2>&1 || die "конфиг малины не прошёл xray -test"
+  sudo bash -c "cat '$tmp' > '$PI_XRAY_CONF'"
+  rm -f "$tmp"
+  sudo systemctl restart xray; sleep 1
+  systemctl is-active --quiet xray && ok "xray на малине перезапущен" || err "xray на малине не поднялся"
+}
+
+# ── проверка выхода ───────────────────────────────────────────────────
+verify_exit(){
+  hd "Проверка"
+  local last sport ip
+  last="$(python3 -c "import json;c=json.load(open('$CHAIN_JSON'));print(c['hops'][-1]['host'])")"
+  sport="$(python3 -c "import json;c=json.load(open('$CHAIN_JSON'));print(c.get('socks_test_port',10808))")"
+  say "  поднимаю туннель…"; gate tunnel up >/dev/null 2>&1 || sudo bash /usr/local/bin/gate-tproxy-up.sh >/dev/null 2>&1 || true
+  sleep 2
+  ip="$(curl -s --max-time 12 --socks5-hostname "127.0.0.1:$sport" https://api.ipify.org 2>/dev/null)"
+  if [ "$ip" = "$last" ]; then
+    ok "выход через цепочку = $ip (последний хоп) — ЦЕПОЧКА РАБОТАЕТ"
+  elif [ -n "$ip" ]; then
+    err "выход = $ip, а ждали последний хоп $last (проверь конфиги/ключи)"
+  else
+    err "выход не определился — xray/цепочка не отвечает. Логи: gate logs"
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+cmd_show(){
+  [ -f "$CHAIN_JSON" ] || die "цепочка не настроена ($CHAIN_JSON нет). Запусти: gate setup"
+  python3 -c "
+import json
+c=json.load(open('$CHAIN_JSON'))
+print('SNI:', c['sni'], '| target:', c['target'])
+for i,h in enumerate(c['hops']):
+    role='ВЫХОД' if i==len(c['hops'])-1 else 'реле'
+    print(f\"  {i}. {h.get('name','?'):4} {h['host']:16} :{h['port']}  {role}  uuid={h['uuid'][:8]}… sid={h['shortid']}\")
+"
+}
+
+cmd_redeploy(){
+  [ -f "$CHAIN_JSON" ] || die "нет $CHAIN_JSON — сначала gate setup"
+  need xray; need python3
+  local n; n="$(python3 -c "import json;print(len(json.load(open('$CHAIN_JSON'))['hops']))")"
+  hd "Передеплой всей цепочки ($n хопов) из $CHAIN_JSON"
+  for ((i=0;i<n;i++)); do
+    hd "Хоп $i ($(hop_host "$i"))"; push_config "$i"
+    [ "$i" -eq $((n-1)) ] && deploy_exit_helpers "$i"
+  done
+  deploy_pi
+  verify_exit
+}
+
+cmd_setup(){
+  need xray; need python3; need ssh; need curl
+  [ -f "$RENDER" ] || die "нет рендерера $RENDER"
+  [ -f "$BOOTSTRAP" ] || die "нет $BOOTSTRAP"
+
+  printf "%s╔════════════════════════════════════════════════╗%s\n" "$C" "$R"
+  printf "%s║  gate setup — развёртывание цепочки Reality     ║%s\n" "$C" "$R"
+  printf "%s╚════════════════════════════════════════════════╝%s\n" "$C" "$R"
+
+  ensure_mgmt_key
+
+  local sni nhops
+  sni="$(ask "SNI/камуфляж" "ya.ru")"
+  nhops="$(ask "Сколько хопов в цепочке (вкл. выход)" "2")"
+  [[ "$nhops" =~ ^[0-9]+$ ]] && [ "$nhops" -ge 1 ] || die "число хопов?"
+
+  # собираем хопы
+  local hops_json="" defname
+  for ((i=0;i<nhops;i++)); do
+    defname="C$((i+1))"
+    hd "Хоп $((i+1)) из $nhops $([ "$i" -eq "$((nhops-1))" ] && echo '(ВЫХОД)' || echo '(реле)')"
+    local name host port host_def
+    name="$(ask "  имя" "$defname")"
+    host="$(ask "  IP/host" "")"
+    [ -n "$host" ] || die "нужен host"
+    port="$(ask "  порт reality" "443")"
+
+    # доп. IP (если у сервера их несколько): апстрим заходит на host, а исходящее плечо
+    # к следующему хопу / в инет / прокси / VPN уходит с send_through (включая управляющий
+    # SSH). Спрашиваем только если у сервера есть второй IP (или значения уже были).
+    local listen="" send_through="" odl ods
+    odl="$(old_hop_field "$host" listen)"; ods="$(old_hop_field "$host" send_through)"
+    if [ -n "$odl$ods" ] || yes "  у $host есть второй IP (разнести вход/исходящее)?"; then
+      listen="$(ask "    IP для входящего reality (Enter = все)" "$odl")"
+      send_through="$(ask "    IP исходящего к след.хопу/инет, вкл. SSH (Enter = как host)" "$ods")"
+    fi
+
+    # переиспользуем ключи, если хост уже был в старом chain.json (не ротируем зря)
+    local uuid priv pub sid kp
+    uuid="$(old_hop_field "$host" uuid)"; priv="$(old_hop_field "$host" privkey)"
+    pub="$(old_hop_field "$host" pubkey)"; sid="$(old_hop_field "$host" shortid)"
+    if [ -n "$uuid" ] && [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ]; then
+      ok "ключи для $host переиспользованы из текущей цепочки"
+    else
+      uuid="$(gen_uuid)"; kp="$(gen_keypair)"; priv="${kp% *}"; pub="${kp#* }"; sid="$(gen_shortid)"
+      ok "сгенерированы новые ключи Reality"
+    fi
+    local comma=""; [ "$i" -gt 0 ] && comma=","
+    local extra=""
+    [ -n "$listen" ]       && extra+=",\"listen\":\"$listen\""
+    [ -n "$send_through" ] && extra+=",\"send_through\":\"$send_through\""
+    hops_json+="$comma{\"name\":\"$name\",\"host\":\"$host\",\"port\":$port,\"uuid\":\"$uuid\",\"privkey\":\"$priv\",\"pubkey\":\"$pub\",\"shortid\":\"$sid\"$extra}"
+  done
+
+  # пишем chain.json
+  printf '{"sni":"%s","target":"%s:443","tproxy_port":12345,"socks_test_port":10808,"egress_mark":255,"mgmt_key":"%s","ssh_user":"%s","hops":[%s]}' \
+    "$sni" "$sni" "$MGMT_KEY" "$SSH_USER" "$hops_json" | python3 -m json.tool | write_chain
+  ok "chain.json записан"
+  cmd_show
+
+  say ""
+  say "Разворачиваю по очереди, хоп за хопом. Для каждого покажу, какой ключ"
+  say "добавить на этот VPS (на C1 — ключ малины, на C2 — ключ C1, и т.д.)."
+  yes "Поехали?" || { say "Цепочка сохранена, разлить позже: gate setup redeploy"; exit 0; }
+
+  local n i name host
+  n="$(python3 -c "import json;print(len(json.load(open('$CHAIN_JSON'))['hops']))")"
+  for ((i=0; i<n; i++)); do
+    host="$(hop_host "$i")"
+    name="$(python3 -c "import json;print(json.load(open('$CHAIN_JSON'))['hops'][$i].get('name','hop$i'))")"
+    hd "Хоп $((i+1))/$n: $name ($host) — $(python3 "$RENDER" role "$CHAIN_JSON" "$i")"
+
+    # какой ключ добавить на ЭТОТ VPS
+    if [ "$i" -eq 0 ]; then
+      reveal_and_wait "$(cat "$MGMT_KEY.pub")" "$name ($host)" "ключ МАЛИНЫ"
+    else
+      reveal_and_wait "$NEXT_PUB" "$name ($host)" "ключ предыдущего хопа ($(hop_host $((i-1))))"
+    fi
+
+    if ! hop_reachable "$i"; then
+      err "не достучаться до $name по SSH"
+      if [ "$i" -eq 0 ]; then say "  Проверь: ключ малины в root@authorized_keys на $host, порт 22 открыт."
+      else say "  Проверь: ключ предыдущего хопа добавлен на $host; предыдущие хопы живы."; fi
+      yes "  Повторить?" && { hop_reachable "$i" || die "всё ещё недоступен"; } || die "прервано"
+    fi
+    ok "ssh доступен"
+
+    bootstrap_hop "$i"
+    deploy_config "$i"
+    [ "$i" -eq $((n-1)) ] && deploy_exit_helpers "$i"  # выход: C2-side хелперы (vpn/osfp) сразу
+    [ "$i" -gt 0 ] && lock_hop "$i"                 # нон-entry: :22 только с предыдущего
+    [ "$i" -lt $((n-1)) ] && make_link_key "$i"     # ключ для доступа к следующему хопу
+  done
+
+  deploy_pi
+  verify_exit
+
+  hd "Готово"
+  say "Цепочка развёрнута. Ключ малины — только на C1; C2/C3 доступны лишь через предыдущий хоп."
+  say "  ${B}gate info${R} / ${B}gate tunnel status${R} — статус"
+  say "  ${B}gate setup show${R}      — показать цепочку"
+  say "  ${B}gate setup redeploy${R}  — перелить конфиги (после правки chain.json или замены сервера)"
+}
+
+case "${1:-setup}" in
+  ""|setup) cmd_setup ;;
+  redeploy) cmd_redeploy ;;
+  show)     cmd_show ;;
+  *) echo "gate setup {| redeploy | show}"; exit 1 ;;
+esac

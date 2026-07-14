@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# gate-osfp (на ВЫХОДНОМ хопе, напр. C2): контроллер OS-fingerprint спуфа.
+# Запускает хендлер gate-osfp.py (NFQUEUE) и ставит правило mangle/POSTROUTING на
+# туннельные интерфейсы (ppp0 для PPTP, tun0 для OpenVPN), чтобы исходящие SYN из
+# туннеля переписывались под выбранную ОС. queue-bypass: если хендлер не запущен —
+# пакеты идут как есть (туннель не ломается). Работает только с L3-туннелем; для
+# носка неприменим (нода носка пересоздаёт TCP своим ядром).
+set -u
+PY=/usr/local/bin/gate-osfp.py
+QNUM=1
+PROFILE_F=/etc/gate/osfp.profile
+LOG=/var/log/gate-osfp.log
+IFACES="ppp0 tun0"
+
+add_rules(){
+  local d
+  for d in $IFACES; do
+    iptables -t mangle -C POSTROUTING -o "$d" -p tcp --tcp-flags SYN,RST,ACK,FIN SYN \
+      -j NFQUEUE --queue-num "$QNUM" --queue-bypass 2>/dev/null \
+    || iptables -t mangle -A POSTROUTING -o "$d" -p tcp --tcp-flags SYN,RST,ACK,FIN SYN \
+      -j NFQUEUE --queue-num "$QNUM" --queue-bypass
+  done
+}
+del_rules(){
+  local d
+  for d in $IFACES; do
+    while iptables -t mangle -D POSTROUTING -o "$d" -p tcp --tcp-flags SYN,RST,ACK,FIN SYN \
+      -j NFQUEUE --queue-num "$QNUM" --queue-bypass 2>/dev/null; do :; done
+  done
+}
+
+on(){
+  local p="${1:-apple}"
+  case "$p" in apple|windows|linux) ;; *) echo "профиль: apple|windows|linux"; exit 1 ;; esac
+  command -v python3 >/dev/null 2>&1 || { echo "нет python3 на хопе"; exit 1; }
+  [ -f "$PY" ] || { echo "нет $PY на хопе — пересоставь gate osfp (доставка скрипта)"; exit 1; }
+  python3 -c 'import netfilterqueue, scapy' 2>/dev/null \
+    || { echo "нет netfilterqueue/scapy на хопе — перезапусти vps-bootstrap.sh"; exit 1; }
+  mkdir -p /etc/gate; echo "$p" > "$PROFILE_F"
+  pkill -f "$PY" 2>/dev/null; sleep 1
+  nohup python3 "$PY" "$QNUM" "$p" >"$LOG" 2>&1 &
+  sleep 2
+  if pgrep -f "$PY" >/dev/null; then
+    add_rules
+    echo "OS-спуф ВКЛ (профиль $p, pid $(pgrep -f "$PY" | tr '\n' ' '))"
+  else
+    echo "хендлер НЕ запустился:"; tail -5 "$LOG"; exit 1
+  fi
+}
+off(){
+  del_rules
+  pkill -f "$PY" 2>/dev/null
+  echo "OS-спуф ВЫКЛ"
+}
+status(){
+  local p; p=$(cat "$PROFILE_F" 2>/dev/null || echo —)
+  if pgrep -f "$PY" >/dev/null; then echo "хендлер: запущен (профиль $p)"; else echo "хендлер: не запущен"; fi
+  local d n=0
+  for d in $IFACES; do
+    iptables -t mangle -C POSTROUTING -o "$d" -p tcp --tcp-flags SYN,RST,ACK,FIN SYN \
+      -j NFQUEUE --queue-num "$QNUM" --queue-bypass 2>/dev/null && { echo "правило: $d ok"; n=$((n+1)); }
+  done
+  [ "$n" = 0 ] && echo "правило: нет"
+  return 0
+}
+
+case "${1:-status}" in
+  on) shift; on "$@" ;;
+  off) off ;;
+  status) status ;;
+  *) echo "gate-osfp {on [apple|windows|linux]|off|status}" ;;
+esac

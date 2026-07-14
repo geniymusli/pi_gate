@@ -1,0 +1,10 @@
+[Unit]
+Description=gate perf monitor (CPU/RAM/temp + C1 loss; via `gate logs perf on`)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/gate-monitor
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

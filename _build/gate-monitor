@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gate perf-монитор: CPU/RAM/темп + потери до C1 + статус xray.
+# Включается через `gate logs perf on` (systemd: gate-monitor.service).
+# Пишет строку раз в $INT секунд в $LOG. По умолчанию ВЫКЛЮЧЕН (бережём SD).
+LOG=/var/log/gate-monitor.log
+INT="${GATE_PERF_INTERVAL:-30}"
+# C1 (первый хоп) берём из chain.json — НЕ хардкодим (иначе утечка чужого/старого IP в раздачу).
+# WAN-интерфейс — из gate.conf (выбирается при установке).
+CHAIN_JSON="${CHAIN_JSON:-/etc/gate/chain.json}"
+[ -f /etc/gate/gate.conf ] && . /etc/gate/gate.conf 2>/dev/null
+C1="${GATE_C1:-$(python3 -c "import json;print(json.load(open('$CHAIN_JSON'))['hops'][0]['host'])" 2>/dev/null)}"
+WAN="${GATE_WAN:-${WAN_ETH:-eth0}}"
+NCPU=$(nproc 2>/dev/null || echo 1)
+
+rxtx(){ cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || echo 0; }
+
+prx=$(rxtx "$WAN" rx_bytes); ptx=$(rxtx "$WAN" tx_bytes); pt=$(date +%s)
+while true; do
+  sleep "$INT"
+  ts=$(date '+%F %T')
+  read -r l1 _ < /proc/loadavg
+  mem=$(free -m | awk '/^Mem:/{printf "%d/%dMB", $3, $2}')
+  temp=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "?")
+  # throughput на WAN с прошлой выборки
+  crx=$(rxtx "$WAN" rx_bytes); ctx=$(rxtx "$WAN" tx_bytes); ct=$(date +%s)
+  dt=$(( ct - pt )); [ "$dt" -le 0 ] && dt=1
+  dn=$(awk "BEGIN{printf \"%.2f\", ($crx-$prx)*8/1000000/$dt}")
+  up=$(awk "BEGIN{printf \"%.2f\", ($ctx-$ptx)*8/1000000/$dt}")
+  prx=$crx; ptx=$ctx; pt=$ct
+  loss=$(ping -c 3 -i 0.2 -W 1 "$C1" 2>/dev/null | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+  xr=$(systemctl is-active xray 2>/dev/null)
+  echo "$ts load=${l1}/${NCPU} mem=$mem temp=${temp}C wan=${dn}/${up}Mbps c1loss=${loss:-?}% xray=$xr" >> "$LOG"
+done

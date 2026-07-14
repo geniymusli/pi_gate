@@ -1,0 +1,20 @@
+[Unit]
+Description=gate privacy tunnel (TPROXY -> reality-s1 -> C1 -> C2 + killswitch)
+After=network-online.target hostapd.service xray.service
+Wants=network-online.target
+Requires=xray.service
+# при перезапуске hostapd (смена канала/диапазона) переподнять tproxy:
+# иначе AP-интерфейс моргает и из table 100 пропадает маршрут клиентской подсети
+PartOf=hostapd.service
+After=hostapd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/gate tunnel up
+ExecStop=/usr/local/bin/gate tunnel down
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

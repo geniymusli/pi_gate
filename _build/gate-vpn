@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# gate-vpn (на ВЫХОДНОМ хопе, напр. C2): VPN-выход OpenVPN/PPTP с policy-routing
+# и killswitch. Метим трафик xray (fwmark) → отдельная таблица → VPN-интерфейс.
+# SSH, reality-канал и сокет самого VPN-клиента НЕ метятся → идут по eth0 (доступ
+# к хопу потерять нельзя). Конфиг в /etc/gate/vpn/: type(ovpn|pptp), client.ovpn
+# (+auth.txt), для pptp — peer-файл /etc/ppp/peers/gate-vpn.
+set -u
+DIR=/etc/gate/vpn
+TABLE=200
+MARK=2
+LOG=/var/log/gate-vpn.log
+
+vpn_type(){ cat "$DIR/type" 2>/dev/null; }
+
+# Пакеты (openvpn/ppp/pptp-linux) и GRE-модули ставит vps-bootstrap.sh при сетапе хопа.
+# Здесь только проверяем наличие клиента (без скачивания) и мгновенно дочищаем GRE для
+# PPTP (modprobe + allow) — на случай хопа, провиженного до этого изменения.
+require_client(){
+  case "$1" in
+    ovpn) command -v openvpn >/dev/null 2>&1 || { echo "нет openvpn на хопе — перезапусти vps-bootstrap.sh"; exit 1; } ;;
+    pptp) command -v pptp    >/dev/null 2>&1 || { echo "нет pptp на хопе — перезапусти vps-bootstrap.sh"; exit 1; }
+          modprobe nf_conntrack_pptp 2>/dev/null; modprobe ip_gre 2>/dev/null
+          iptables -C INPUT  -p gre -j ACCEPT 2>/dev/null || iptables -I INPUT  -p gre -j ACCEPT
+          iptables -C OUTPUT -p gre -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p gre -j ACCEPT ;;
+  esac
+}
+
+# Таблица VPN: blackhole-дефолт (fail-closed, если интерфейс не поднимется) + правило
+# fwmark→table. rp_filter ослабляем, иначе ответы по tun могут дропаться.
+setup_route(){
+  ip route replace blackhole default table "$TABLE" metric 1000 2>/dev/null
+  ip rule show | grep -q "fwmark 0x$MARK " || ip rule add fwmark "$MARK" table "$TABLE" 2>/dev/null
+  sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null
+}
+teardown_route(){
+  while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+  ip route flush table "$TABLE" 2>/dev/null || true
+}
+
+# Дождаться интерфейса с IPv4 и прописать его дефолтом в таблицу VPN (metric 1 > blackhole).
+wait_iface(){
+  local dev="$1" i=0
+  while [ "$i" -lt 45 ]; do
+    if ip -4 addr show "$dev" 2>/dev/null | grep -q 'inet '; then
+      ip route replace default dev "$dev" table "$TABLE" metric 1 2>/dev/null
+      return 0
+    fi
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
+
+up(){
+  local t; t=$(vpn_type)
+  [ -n "$t" ] || { echo "нет $DIR/type — сначала gate vpn set"; exit 1; }
+  require_client "$t"
+  setup_route
+  : > "$LOG" 2>/dev/null || true
+  # Накопитель push'нутых туннелем DNS (одна точка правды для обоих типов; читает малина).
+  # Чистим ПЕРЕД подъёмом, чтобы не утащить DNS прошлой сессии, если новый сервер их не даёт.
+  mkdir -p "$DIR"; : > "$DIR/pushed-dns"
+  case "$t" in
+    ovpn)
+      [ -f "$DIR/client.ovpn" ] || { echo "нет $DIR/client.ovpn"; exit 1; }
+      pkill -f "openvpn --config $DIR/client.ovpn" 2>/dev/null; sleep 1
+      local auth=""; [ -f "$DIR/auth.txt" ] && auth="--auth-user-pass $DIR/auth.txt"
+      # up-хук: собрать push'нутые сервером dhcp-option DNS в общий накопитель (как usepeerdns
+      # у pptp). С route-nopull опции всё равно приходят в foreign_option_* окружения скрипта.
+      cat > "$DIR/ovpn-up.sh" <<'UP'
+#!/bin/sh
+out=/etc/gate/vpn/pushed-dns; mkdir -p /etc/gate/vpn
+i=1
+while eval "opt=\${foreign_option_$i:-}"; [ -n "$opt" ]; do
+  case "$opt" in "dhcp-option DNS "*) echo "${opt#dhcp-option DNS }" >> "$out" ;; esac
+  i=$((i+1))
+done
+sort -u "$out" -o "$out" 2>/dev/null || true
+UP
+      chmod 755 "$DIR/ovpn-up.sh"
+      # route-nopull + route-noexec: openvpn НЕ ставит НИ одного маршрута (ни пушнутых сервером,
+      # ни ЛОКАЛЬНЫХ из конфига). КРИТИЧНО: в чужих .ovpn часто есть `redirect-gateway def1` —
+      # один route-nopull его НЕ давит (он локальный, не пушнутый), и openvpn увёл бы default
+      # route C2 в туннель → C2 теряет связь со всем (включая управление с C1). route-noexec
+      # это исключает: main-таблицу не трогаем вообще, дефолт в таблицу VPN ставит wait_iface.
+      # Побочно делает безопасным прерывание `on` на полпути (main-роутинг C2 не меняется).
+      # script-security 2 нужен, иначе up-хук не запустится и DNS не снимется.
+      openvpn --config "$DIR/client.ovpn" $auth --route-nopull --route-noexec \
+        --up "$DIR/ovpn-up.sh" --script-security 2 --log-append "$LOG" --daemon
+      sleep 3; wait_iface tun0 || { echo "tun0 не поднялся (см. $LOG)"; exit 1; }
+      ;;
+    pptp)
+      [ -f /etc/ppp/peers/gate-vpn ] || { echo "нет peer-файла pptp"; exit 1; }
+      # ip-up хук: дописывает маршрут в таблицу VPN при КАЖДОМ подъёме ppp0 (медленная
+      # негоциация на дальних серверах, persist-reconnect) — надёжнее одноразового wait_iface,
+      # который мог не дождаться и оставить killswitch без маршрута.
+      mkdir -p /etc/ppp/ip-up.d
+      cat > /etc/ppp/ip-up.d/gate-vpn <<'HOOK'
+#!/bin/sh
+[ "$6" = gate-vpn ] || exit 0
+ip route replace default dev "$1" table 200 metric 1
+# push'нутые сервером DNS (usepeerdns пишет /etc/ppp/resolv.conf) → общий накопитель
+mkdir -p /etc/gate/vpn
+awk '/^nameserver/{print $2}' /etc/ppp/resolv.conf 2>/dev/null | sort -u > /etc/gate/vpn/pushed-dns
+HOOK
+      chmod 755 /etc/ppp/ip-up.d/gate-vpn
+      pkill -f "pppd call gate-vpn" 2>/dev/null; sleep 1
+      ( pppd call gate-vpn nodefaultroute >>"$LOG" 2>&1 & )
+      sleep 4; wait_iface ppp0 || echo "ppp0 ещё не поднялся — pppd (persist) добивается, маршрут допишет ip-up хук"
+      ;;
+    *) echo "неизвестный тип: $t"; exit 1 ;;
+  esac
+  echo "VPN ($t) up"
+}
+
+down(){
+  pkill -f "openvpn --config $DIR/client.ovpn" 2>/dev/null || true
+  pkill -f "pppd call gate-vpn" 2>/dev/null || true
+  teardown_route
+  echo "VPN down"
+}
+
+status(){
+  local rule=no; ip rule show | grep -q "fwmark 0x$MARK " && rule=yes
+  echo "type:  $(vpn_type 2>/dev/null || echo —)"
+  [ "$rule" = yes ] && echo "rule:  ok (fwmark $MARK → table $TABLE)" || echo "rule:  нет"
+  echo "table $TABLE:"; ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /'
+  local up=no
+  for d in tun0 ppp0; do
+    if ip -4 addr show "$d" 2>/dev/null | grep -q 'inet '; then
+      echo "iface: $d up ($(ip -4 -o addr show "$d" | awk '{print $4}'))"; up=yes
+    fi
+  done
+  if [ "$up" = no ]; then
+    [ "$rule" = yes ] && echo "iface: нет (killswitch активен — меченый трафик дропается)" \
+                      || echo "iface: нет (VPN выключен)"
+  fi
+}
+
+case "${1:-status}" in
+  up) up ;;
+  down) down ;;
+  status) status ;;
+  *) echo "gate-vpn {up|down|status}" ;;
+esac

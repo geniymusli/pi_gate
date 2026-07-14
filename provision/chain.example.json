@@ -1,0 +1,31 @@
+{
+  "_comment": "ПРИМЕР chain.json — заглушки. Реальный лежит на малине в /etc/gate/chain.json (600) и создаётся визардом `gate setup`. НЕ клади сюда настоящие ключи/IP — этот файл в git.",
+  "sni": "www.microsoft.com",
+  "target": "www.microsoft.com:443",
+  "tproxy_port": 12345,
+  "socks_test_port": 10808,
+  "egress_mark": 255,
+  "mgmt_key": "/home/pi/.ssh/gate_to_s1",
+  "ssh_user": "root",
+  "hops": [
+    {
+      "name": "C1",
+      "host": "203.0.113.10",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "privkey": "REALITY_PRIVATE_KEY_C1_BASE64URL",
+      "pubkey": "REALITY_PUBLIC_KEY_C1_BASE64URL",
+      "shortid": "0011aabb",
+      "next_key": "/root/.ssh/s1_to_s2"
+    },
+    {
+      "name": "C2",
+      "host": "198.51.100.20",
+      "port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "privkey": "REALITY_PRIVATE_KEY_C2_BASE64URL",
+      "pubkey": "REALITY_PUBLIC_KEY_C2_BASE64URL",
+      "shortid": "2233ccdd"
+    }
+  ]
+}
