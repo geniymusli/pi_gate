@@ -439,6 +439,63 @@ cmd_ap(){
     off)   sudo systemctl stop hostapd; echo "AP остановлена";;
     restart)  sudo systemctl restart hostapd dnsmasq; echo "AP перезапущена";;
 
+    iface)
+      # Сменить интерфейс РАЗДАЧИ уже после установки (докупил USB-свисток / убрал его).
+      # Делает то же, что установщик: hostapd/dnsmasq/override/NM-unmanaged/gate.conf + рестарт.
+      local newif="${2:-}"
+      if [ -z "$newif" ]; then
+        echo "Использование: gate ap iface <интерфейс>   (сейчас AP=$AP_IFACE)"
+        echo "Wi-Fi адаптеры: $(for d in /sys/class/net/*/wireless; do basename "$(dirname "$d")"; done 2>/dev/null | tr '\n' ' ')"
+        exit 1
+      fi
+      [ -e "/sys/class/net/$newif" ] || { echo "нет интерфейса $newif"; exit 1; }
+      [ -e "/sys/class/net/$newif/wireless" ] || { echo "$newif — не Wi-Fi (для AP нужен беспроводной)"; exit 1; }
+      [ "$newif" = "$WAN_ETH" ] && { echo "$newif — это WAN-кабель, нельзя под раздачу"; exit 1; }
+      [ "$newif" = "$AP_IFACE" ] && { echo "AP уже на $newif"; exit 0; }
+      if [ "$newif" = "$WAN_WIFI" ] && [ "$(default_dev)" = "$WAN_WIFI" ]; then
+        echo "$newif сейчас несёт интернет (WAN-Wi-Fi). Переведи WAN на кабель: gate wan eth"; exit 1
+      fi
+      local oldif="$AP_IFACE" apaddr="${AP_ADDR:-192.168.50.1}" new_wan_wifi
+      case "$newif" in wlan0) new_wan_wifi="";; *) new_wan_wifi="wlan0";; esac
+      echo "→ Переношу раздачу: $oldif → $newif…"
+      sudo rfkill unblock wifi 2>/dev/null || true
+      sudo sed -i "s/^interface=.*/interface=$newif/" "$HOSTAPD_CONF"
+      sudo sed -i "s/^interface=.*/interface=$newif/" /etc/dnsmasq.d/gate.conf
+      sudo install -d /etc/systemd/system/hostapd.service.d
+      sudo tee /etc/systemd/system/hostapd.service.d/override.conf >/dev/null <<APOV
+[Unit]
+Wants=network.target
+After=network.target
+[Service]
+ExecStartPre=/sbin/ip addr flush dev $newif
+ExecStartPre=/sbin/ip addr add $apaddr/24 dev $newif
+ExecStartPre=/sbin/ip link set $newif up
+APOV
+      sudo tee /etc/NetworkManager/conf.d/99-gate-unmanaged.conf >/dev/null <<NMEOF
+[keyfile]
+unmanaged-devices=interface-name:$newif
+NMEOF
+      sudo sed -i "s/^AP_IFACE=.*/AP_IFACE=\"$newif\"/; s/^WAN_WIFI=.*/WAN_WIFI=\"$new_wan_wifi\"/" /etc/gate/gate.conf
+      sudo systemctl stop hostapd 2>/dev/null
+      sudo ip addr flush dev "$oldif" 2>/dev/null || true          # снять AP-IP со старого
+      sudo nmcli device set "$newif" managed no  2>/dev/null || true
+      sudo nmcli device set "$oldif" managed yes 2>/dev/null || true   # старый — обратно под NM
+      sudo systemctl daemon-reload
+      sudo systemctl restart NetworkManager 2>/dev/null || true
+      sleep 1
+      sudo systemctl restart hostapd dnsmasq 2>/dev/null
+      sleep 1
+      if svc_active hostapd; then
+        echo "  ✓ раздача теперь на $newif (WAN-Wi-Fi: ${new_wan_wifi:-нет, только кабель})"
+        [ -n "$WAN_WIFI" ] && [ -z "$new_wan_wifi" ] && echo "  (wlan0 занят раздачей — интернет только по кабелю)"
+        [ -z "$WAN_WIFI" ] && [ -n "$new_wan_wifi" ] && echo "  (освободился wlan0 — теперь можно gate wan wifi)"
+        echo "  туннель под новый интерфейс: gate tunnel restart"
+      else
+        echo "  ✗ hostapd не поднялся на $newif — sudo journalctl -u hostapd -n 30"
+        echo "    иногда нужен reboot (если интерфейс держал wpa_supplicant)"
+      fi
+      ;;
+
     ssid)
       local new="${2:-}"
       [ -z "$new" ] && { echo "Использование: gate ap ssid \"Новое имя\""; exit 1; }
@@ -1854,6 +1911,7 @@ ${hr}━━ WAN — как малина в инете ━━━━━━━━�
 ${hr}━━ РАЗДАЧА (AP для устройств) ━━━━━━━━━━━━━━━━━━━━━━━━━${R}
   ${g}gate ap${R}                      статус (SSID / MAC / клиенты)
   ${g}gate ap on|off|restart${R}       вкл / выкл / перезапуск
+  ${g}gate ap iface <интерфейс>${R}    сменить интерфейс раздачи (свисток↔встроенный wlan0)
   ${g}gate ap ssid "Имя"${R} ${B}|${R} ${g}ap pass "пароль"${R}   сменить SSID / пароль
   ${g}gate ap mac${R} ${D}[random|aa:bb:cc:dd:ee:ff|reset]${R}  MAC адаптера ${D}(одинаково у eth/wifi/ap)${R}
 
