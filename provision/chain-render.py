@@ -76,10 +76,13 @@ def role(c, i):
 
 
 def _log():
+    # Серверам (реле/выход) файловые логи НЕ пишем: xray бежит под nobody, а файл в
+    # /var/log/xray, созданный root'ом при `xray -test`, для nobody недоступен на запись
+    # → сервис не стартует. error идёт в stderr → journald (виден `journalctl -u xray`),
+    # access отключён (приватность + меньше износ диска). Как у малины в _pi_log().
     return {
         "loglevel": "warning",
-        "error": "/var/log/xray/error.log",
-        "access": "/var/log/xray/access.log",
+        "access": "none",
     }
 
 
