@@ -295,6 +295,14 @@ visudo -c >/dev/null 2>&1 && ok "sudo без пароля для $LOGIN_USER" ||
 # 8) сервисы: поднимаем инфраструктуру (БЕЗ gate-tunnel — его поднимет gate setup, см. ниже)
 say "${B}→ Включаю сервисы…${N}"
 systemctl enable --now dnscrypt-proxy >/dev/null 2>&1 || warn "dnscrypt-proxy не стартовал"
+# Страна Wi-Fi на СИСТЕМНОМ уровне (regdomain). На свежей малине встроенный Wi-Fi заблокирован
+# регуляторкой, пока страна не задана → hostapd на wlan0 не стартует. hostapd.conf с country_code
+# этого НЕ решает. Ставим через raspi-config + снимаем rfkill. (Частый провал AP на Pi.)
+if command -v raspi-config >/dev/null 2>&1; then
+  raspi-config nonint do_wifi_country "$COUNTRY" >/dev/null 2>&1 && ok "страна Wi-Fi (regdomain) = $COUNTRY" \
+    || warn "не удалось задать страну Wi-Fi через raspi-config"
+fi
+rfkill unblock wifi 2>/dev/null || true
 # ВАЖНО: сначала отдаём AP-интерфейс из-под NetworkManager (unmanaged уже записан выше),
 # и только ПОТОМ поднимаем hostapd — иначе NM держит wlan0 и hostapd не может его забрать
 # (частый провал при AP на встроенном wlan0). Раньше NM перезапускался ПОСЛЕ hostapd → фейл.
