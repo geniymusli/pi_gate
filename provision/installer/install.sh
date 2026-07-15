@@ -295,9 +295,15 @@ visudo -c >/dev/null 2>&1 && ok "sudo без пароля для $LOGIN_USER" ||
 # 8) сервисы: поднимаем инфраструктуру (БЕЗ gate-tunnel — его поднимет gate setup, см. ниже)
 say "${B}→ Включаю сервисы…${N}"
 systemctl enable --now dnscrypt-proxy >/dev/null 2>&1 || warn "dnscrypt-proxy не стартовал"
-systemctl enable --now hostapd        >/dev/null 2>&1 || warn "hostapd не стартовал (проверь, что $AP_IFACE поддерживает AP)"
-systemctl enable --now dnsmasq        >/dev/null 2>&1 || warn "dnsmasq не стартовал"
+# ВАЖНО: сначала отдаём AP-интерфейс из-под NetworkManager (unmanaged уже записан выше),
+# и только ПОТОМ поднимаем hostapd — иначе NM держит wlan0 и hostapd не может его забрать
+# (частый провал при AP на встроенном wlan0). Раньше NM перезапускался ПОСЛЕ hostapd → фейл.
+nmcli device set "$AP_IFACE" managed no >/dev/null 2>&1 || true
 systemctl restart NetworkManager      >/dev/null 2>&1 || true
+sleep 1
+systemctl enable --now hostapd        >/dev/null 2>&1 \
+  || warn "hostapd не стартовал (проверь rfkill/поддержку AP на $AP_IFACE; после reboot обычно встаёт)"
+systemctl enable --now dnsmasq        >/dev/null 2>&1 || warn "dnsmasq не стартовал"
 ok "hostapd / dnsmasq / dnscrypt-proxy включены"
 
 # 9) заморозка риск-пакетов: apt upgrade не должен внезапно менять ядро/Wi-Fi-драйвер/
