@@ -129,21 +129,24 @@ def build_argv(action, p):
     fixed = {
         "info":            ["info"],
         "exit_status":     ["exit"],
-        "exit_off":        ["exit", "off"],
         "dns_test":        ["dns"],
         "tunnel_status":   ["tunnel", "status"],
         "tunnel_up":       ["tunnel", "up"],
         "tunnel_down":     ["tunnel", "down"],
-        "socks_on":        ["socks", "on"],
-        "socks_off":       ["socks", "off"],
+        # Глобальный выход (для всех НЕназначенных). Включение живёт в `gate global …`;
+        # отдельных socks/ovpn/pptp on-off больше нет — осталась только их настройка.
+        "global_status":   ["global"],
+        "global_off":      ["global", "off"],
+        "global_ovpn_on":  ["global", "ovpn", "on"],
+        "global_pptp_on":  ["global", "pptp", "on"],
         "socks_test":      ["socks", "test"],
         "socks_status":    ["socks", "status"],
-        "ovpn_on":         ["ovpn", "on"],
-        "ovpn_off":        ["ovpn", "off"],
         "ovpn_status":     ["ovpn", "status"],
-        "pptp_on":         ["pptp", "on"],
-        "pptp_off":        ["pptp", "off"],
         "pptp_status":     ["pptp", "status"],
+        # Каналы и персональные выходы устройств
+        "client_list":     ["client", "list"],
+        "lanes_status":    ["lanes", "status"],
+        "lanes_apply":     ["lanes", "apply"],
         "osfp_off":        ["osfp", "off"],
         "osfp_status":     ["osfp", "status"],
         "dns_fallback_on": ["dns", "fallback", "on"],
@@ -153,6 +156,32 @@ def build_argv(action, p):
     }
     if action in fixed:
         return fixed[action]
+
+    if action == "global_socks_on":
+        prof = p.get("profile", "")
+        if prof and not NAME_RE.match(prof):
+            raise ValueError("bad socks profile")
+        return ["global", "socks", "on"] + ([prof] if prof else [])
+
+    if action == "client_exit":
+        # устройство адресуем по MAC (стабильнее IP), цель — c2|vpn|auto|socks:<профиль>
+        mac = (p.get("mac") or "").lower()
+        target = p.get("target") or ""
+        if not re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac):
+            raise ValueError("bad mac")
+        if target in ("c2", "vpn", "auto"):
+            pass
+        elif target.startswith("socks:") and NAME_RE.match(target[6:]):
+            pass
+        else:
+            raise ValueError("bad target")
+        return ["client", mac, "exit", target]
+
+    if action == "lanes_init":
+        n = str(p.get("n", "4"))
+        if not n.isdigit() or not (1 <= int(n) <= 16):
+            raise ValueError("bad pool size")
+        return ["lanes", "init", n]
 
     if action == "osfp_on":
         prof = p.get("profile", "")
@@ -250,12 +279,18 @@ def read_state():
                 vtype = ln.split("=", 1)[1].strip()
     except OSError:
         pass
-    if socks == "on":
-        mode = "socks"
-    elif vpn == "on" and vtype in ("ovpn", "pptp"):
-        mode = vtype
-    else:
-        mode = "direct"
+    # Глобальный выход = то, что получают НЕназначенные клиенты (пишет `gate global …`).
+    g = {}
+    try:
+        for ln in open("/etc/gate/global-exit.conf"):
+            ln = ln.strip()
+            if "=" in ln and not ln.startswith("#"):
+                k, v = ln.split("=", 1)
+                g[k.strip()] = v.strip()
+    except OSError:
+        pass
+    gexit = g.get("GLOBAL") or "c2"
+    mode = {"socks": "socks", "ovpn": "ovpn", "pptp": "pptp"}.get(gexit, "direct")
     resolver = ""
     try:
         for ln in open("/etc/dnscrypt-proxy/dnscrypt-proxy.toml"):
@@ -270,12 +305,69 @@ def read_state():
         pass
     return {
         "exit": mode,
+        "global": gexit,
+        "global_socks": g.get("GLOBAL_SOCKS") or "",
         "socks": socks or "off",
         "vpn": vpn or "off",
         "vtype": vtype,
         "dns_fallback": rd("/etc/gate/dns-fallback.state") or "off",
         "resolver": resolver,
     }
+
+
+def read_devices():
+    """Устройства раздачи + их персональные выходы + доступные носки и пул каналов.
+    Читаем файлы напрямую (морда бежит root'ом): парсить цветной вывод CLI хрупко."""
+    # назначения: <MAC> <IP> <канал> <выход> [имя]
+    assigned = {}
+    for ln in _lines("/etc/gate/client-lanes.conf"):
+        f = ln.split()
+        if len(f) >= 4:
+            assigned[f[0].lower()] = {"ch": f[2], "target": f[3]}
+    devs, seen = [], set()
+    # аренды dnsmasq: <expiry> <mac> <ip> <hostname> <clientid>
+    for ln in _lines("/var/lib/misc/dnsmasq.leases"):
+        f = ln.split()
+        if len(f) >= 3:
+            mac, ip = f[1].lower(), f[2]
+            if mac in seen:
+                continue
+            seen.add(mac)
+            a = assigned.get(mac)
+            devs.append({"mac": mac, "ip": ip,
+                         "name": (f[3] if len(f) > 3 and f[3] != "*" else ""),
+                         "target": (a or {}).get("target", ""),
+                         "ch": (a or {}).get("ch", "")})
+    # профили носков
+    profs = []
+    try:
+        for fn in sorted(os.listdir("/etc/gate/profiles/socks")):
+            if fn.endswith(".conf"):
+                profs.append(fn[:-5])
+    except OSError:
+        pass
+    # пул каналов из chain.json
+    pool, used = 0, len({v["ch"] for v in assigned.values() if v["ch"]})
+    try:
+        hops = json.load(open("/etc/gate/chain.json"))["hops"]
+        if hops:
+            common = set((hops[0].get("lane_uuids") or {}).keys())
+            for h in hops:
+                common &= {k for k, v in (h.get("lane_uuids") or {}).items() if v}
+            pool = len(common)
+    except Exception:
+        pass
+    return {"devices": devs, "socks_profiles": profs,
+            "pool": pool, "used": used,
+            "vpn_live": (open("/etc/gate/vpn.state").read().strip() == "on"
+                         if os.path.exists("/etc/gate/vpn.state") else False)}
+
+
+def _lines(path):
+    try:
+        return [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
 
 
 # ─── firewall: открыть порт только LAN, остальное DROP ────────────────
@@ -347,6 +439,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, parse_profiles())
         if path == "/api/state":
             return self._json(200, read_state())
+        if path == "/api/devices":
+            return self._json(200, read_devices())
         return self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -454,25 +548,28 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
 </div>
 
 <div class=card>
-  <h2>Выход в интернет <span class=badge>сейчас: <span id=curmode>…</span></span></h2>
+  <h2>Выход по умолчанию <span class=badge>сейчас: <span id=curmode>…</span></span></h2>
+  <p class=muted>Действует на все устройства, которым не задан персональный выход (ниже).</p>
   <div class=row>
+    <button id=di_off class=off onclick="act('global_off')">прямой C2</button>
+    <button id=ov_on class=on onclick="act('global_ovpn_on')">OpenVPN</button>
+    <button id=pp_on class=on onclick="act('global_pptp_on')">PPTP</button>
+  </div>
+  <div class=row style="margin-top:8px">
     <span class=lbl>носок:</span>
-    <button id=so_on class=on onclick="act('socks_on')">вкл</button>
-    <button id=so_off class=off onclick="act('socks_off')">выкл</button>
+    <select id=gsock></select>
+    <button id=so_on class=on onclick="act('global_socks_on',{profile:gsockVal()})">сделать основным</button>
     <button onclick="act('socks_test')">тест</button>
   </div>
-  <div class=row style="margin-top:8px">
-    <span class=lbl>OpenVPN:</span>
-    <button id=ov_on class=on onclick="act('ovpn_on')">вкл</button>
-    <button id=ov_off class=off onclick="act('ovpn_off')">выкл</button>
-    <span class=lbl style="margin-left:10px">PPTP:</span>
-    <button id=pp_on class=on onclick="act('pptp_on')">вкл</button>
-    <button id=pp_off class=off onclick="act('pptp_off')">выкл</button>
-  </div>
-  <div class=row style="margin-top:8px">
-    <span class=lbl>прямой выход:</span>
-    <button id=di_off class=off onclick="act('exit_off')">выкл активный → C2</button>
-  </div>
+</div>
+
+<div class=card>
+  <h2>Устройства — персональный выход
+    <span class=badge>каналы: <span id=chinfo>…</span></span>
+  </h2>
+  <p class=muted>Ноут прямым C2, один телефон через VPN, другой — через свой носок. Одновременно.</p>
+  <div id=devs class=plist><span class=muted>загрузка…</span></div>
+  <p class=muted>Если выход устройства выключен, его трафик блокируется (fail-closed), а не идёт мимо назначения.</p>
 </div>
 
 <div class=card>
@@ -550,16 +647,50 @@ async function api(path,opt){opt=opt||{};opt.headers=Object.assign({'X-Gate':'1'
 async function loadInfo(){var i=document.getElementById('info');i.className='spin';
   var d=await api('/api/info');if(!d)return;i.textContent=d.out||'(пусто)';i.className=''}
 function mark(id,on){var e=document.getElementById(id);if(e)e.classList.toggle('active',on)}
+function gsockVal(){var e=document.getElementById('gsock');return e?e.value:''}
 async function loadState(){var s=await api('/api/state');if(!s)return;
-  var names={socks:'носок',ovpn:'OpenVPN',pptp:'PPTP',direct:'прямой (C2)'};
+  var names={socks:'носок'+(s.global_socks?' «'+s.global_socks+'»':''),ovpn:'OpenVPN',pptp:'PPTP',direct:'прямой C2'};
   document.getElementById('curmode').textContent=names[s.exit]||s.exit;
-  mark('so_on',s.exit==='socks');  mark('so_off',s.exit!=='socks');
-  mark('ov_on',s.exit==='ovpn');   mark('ov_off',s.exit!=='ovpn');
-  mark('pp_on',s.exit==='pptp');   mark('pp_off',s.exit!=='pptp');
+  mark('so_on',s.exit==='socks');
+  mark('ov_on',s.exit==='ovpn');
+  mark('pp_on',s.exit==='pptp');
   mark('di_off',s.exit==='direct');
   mark('fb_on',s.dns_fallback==='on'); mark('fb_off',s.dns_fallback!=='on');
   if(s.resolver)document.getElementById('res').value=s.resolver}
-async function refresh(){loadInfo();loadState();loadProfiles()}
+
+// ── устройства: у каждого выпадашка выхода ──
+async function loadDevs(){var d=await api('/api/devices');if(!d)return;
+  document.getElementById('chinfo').textContent=d.used+' из '+d.pool;
+  // список носков в селектор глобального выхода
+  var gs=document.getElementById('gsock');
+  if(gs){var cur=gs.value;gs.innerHTML='';
+    if(!d.socks_profiles.length){var o=document.createElement('option');o.value='';o.textContent='(нет профилей)';gs.appendChild(o)}
+    d.socks_profiles.forEach(function(n){var o=document.createElement('option');o.value=n;o.textContent=n;gs.appendChild(o)});
+    if(cur)gs.value=cur}
+  var box=document.getElementById('devs');box.innerHTML='';
+  if(!d.devices.length){box.innerHTML='<span class=muted>нет активных аренд — подключи устройство к Wi-Fi</span>';return}
+  d.devices.forEach(function(dev){
+    var row=document.createElement('div');row.className='pitem';
+    var title=(dev.name||dev.mac)+' · '+dev.ip;
+    var lbl=document.createElement('b');lbl.textContent=title;
+    var sel=document.createElement('select');
+    var opts=[['','по умолчанию'],['c2','прямой C2'],['vpn','VPN (tun0 на C2)']];
+    d.socks_profiles.forEach(function(n){opts.push(['socks:'+n,'носок «'+n+'»'])});
+    opts.forEach(function(o){var e=document.createElement('option');e.value=o[0];e.textContent=o[1];sel.appendChild(e)});
+    sel.value=dev.target||'';
+    sel.onchange=function(){setDev(dev.mac,sel.value)};
+    var note=document.createElement('span');note.className='muted';
+    if(dev.target==='vpn'&&!d.vpn_live)note.textContent='⚠ VPN выключен → блок';
+    else if(dev.ch)note.textContent='канал '+dev.ch;
+    row.appendChild(lbl);row.appendChild(note);row.appendChild(sel);box.appendChild(row)})}
+async function setDev(mac,target){
+  setOut('… назначаю выход',true);
+  var d=await api('/api/action',{method:'POST',
+    body:JSON.stringify({action:'client_exit',mac:mac,target:target||'auto'})});
+  if(!d)return;
+  if(d.error){setOut('ошибка: '+d.error);return}
+  setOut(d.out||('код '+d.code));refresh()}
+async function refresh(){loadInfo();loadState();loadProfiles();loadDevs()}
 async function act(action,extra){setOut('… '+action,true);
   var body=Object.assign({action:action},extra||{});
   var d=await api('/api/action',{method:'POST',body:JSON.stringify(body)});
@@ -590,7 +721,7 @@ function savePptp(){var b={name:gv('qn'),server:gv('qs'),user:gv('qu'),pass:gv('
   ['qn','qs','qu','qpw'].forEach(function(id){document.getElementById(id).value=''})}
 function doWipe(){if(confirm('ОЧИСТКА: удалить ВСЕ профили, стейт и креды на C2? Необратимо.'))act('wipe')}
 async function logout(){await fetch('/logout',{method:'POST'});location.reload()}
-refresh();setInterval(function(){loadInfo();loadState()},20000);
+refresh();setInterval(function(){loadInfo();loadState();loadDevs()},20000);
 </script></body></html>"""
 
 
