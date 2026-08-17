@@ -250,7 +250,27 @@ if [ -f "$TOML" ]; then
   # Сокет dnscrypt (debian, 127.0.2.1:53) НЕ трогаем — он безвреден и не конфликтует с dnsmasq
   # (тот на 127.0.0.1:53 + AP:53). dnscrypt дополнительно слушает 127.0.0.1:5300 из toml — туда
   # и форвардит dnsmasq (server=127.0.0.1#5300). Так на рабочей малине, повторяем 1:1.
+  # netprobe: по умолчанию dnscrypt при СТАРТЕ шлёт UDP-пробу на 9.9.9.9:53. А стартует он
+  # ДО gate-tunnel (tproxy ещё не поднят) → домашний IP светится Quad9 КАЖДУЮ загрузку.
+  # Заворачиваем пробу на loopback: «сеть есть» мгновенно, наружу с домашнего WAN ничего не уходит.
+  # ВАЖНО: netprobe_address — ГЛОБАЛЬНЫЙ ключ, обязан быть ДО любой [секции] toml. Если строки
+  # нет — вставляем в НАЧАЛО файла (дописывать в конец нельзя: там [sources] → ключ попадёт
+  # внутрь секции и dnscrypt упадёт с FATAL «Unsupported key in [sources.public-resolvers…]»).
+  if grep -qE "^#? *netprobe_address" "$TOML"; then
+    sed -i "s|^#\? *netprobe_address =.*|netprobe_address = '127.0.0.1:53'|" "$TOML"
+  else
+    sed -i "1i netprobe_address = '127.0.0.1:53'" "$TOML"
+  fi
 fi
+# dnscrypt стартует ПОСЛЕ туннеля: периодическое обновление списка резолверов (HTTPS к
+# download.dnscrypt.info, refresh 72ч) не должно уходить напрямую с домашнего WAN до tproxy.
+# Ordering-only (без Requires): если туннель лёг, локальный резолвер малины продолжает жить.
+install -d /etc/systemd/system/dnscrypt-proxy.service.d
+cat > /etc/systemd/system/dnscrypt-proxy.service.d/10-gate-after-tunnel.conf <<'EOF'
+[Unit]
+After=gate-tunnel.service
+EOF
+systemctl daemon-reload >/dev/null 2>&1 || true
 
 # NetworkManager: AP-интерфейс — unmanaged; резолвер малины = локальный; зонд связи off
 install -d /etc/NetworkManager/conf.d
