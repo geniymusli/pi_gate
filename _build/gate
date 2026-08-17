@@ -1180,6 +1180,22 @@ EOF"
       echo "Проверить: gate socks test   •   включить: gate global socks on"
       ;;
 
+    promote)
+      # gate socks promote <имя> — сохранить ТЕКУЩИЙ (безымянный) носок как профиль.
+      # Нужно, чтобы его можно было вешать на устройство (gate client <dev> exit socks:<имя>)
+      # и видеть в веб-панели: там перечислены именно профили. Креды не переспрашиваем —
+      # просто копируем файл, поэтому пароль никуда не «всплывает».
+      local n="${2:-}"
+      prof_name_ok "$n" || { echo "gate socks promote <имя>   ${D}(имя: A-Za-z0-9._-)${R}"; exit 1; }
+      sudo test -f "$SOCKS_CONF" || { echo "Нет текущего носка — сначала: ${YEL}gate socks set <ip> <port> [user] [pass]${R}"; exit 1; }
+      sudo mkdir -p "$PROFILE_DIR/socks"
+      sudo install -m600 "$SOCKS_CONF" "$PROFILE_DIR/socks/$n.conf"
+      [ -f "$SOCKS_CAPS" ] && sudo install -m600 "$SOCKS_CAPS" "$PROFILE_DIR/socks/$n.caps"
+      echo "Текущий носок сохранён как профиль ${B}$n${R}"
+      echo "  ${D}повесить на устройство:${R} gate client <ip|mac|имя> exit socks:$n"
+      echo "  ${D}сделать основным:${R}      gate global socks on $n"
+      ;;
+
     on)
       # gate socks on [профиль] — сделать носок ГЛОБАЛЬНЫМ выходом (зовётся из gate global socks on)
       local prof="${2:-}"
@@ -1265,7 +1281,7 @@ EOF"
       ;;
 
     *)
-      echo "gate socks {set <ip> <port> [user] [pass]|test|status}"
+      echo "gate socks {set <ip> <port> [user] [pass]|promote <имя>|test|status}"
       echo "  ${D}включить глобально: gate global socks on [профиль]${R}"
       echo "  ${D}устройству персонально: gate client <dev> exit socks:<профиль>${R}"
       ;;

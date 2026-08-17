@@ -177,6 +177,12 @@ def build_argv(action, p):
             raise ValueError("bad target")
         return ["client", mac, "exit", target]
 
+    if action == "socks_promote":
+        n = p.get("name", "")
+        if not NAME_RE.match(n):
+            raise ValueError("bad name")
+        return ["socks", "promote", n]
+
     if action == "lanes_init":
         n = str(p.get("n", "4"))
         if not n.isdigit() or not (1 <= int(n) <= 16):
@@ -357,7 +363,17 @@ def read_devices():
             pool = len(common)
     except Exception:
         pass
-    return {"devices": devs, "socks_profiles": profs,
+    # Текущий безымянный носок (gate socks set) — он НЕ профиль, поэтому раньше в панели
+    # его не было видно вообще. Показываем адрес; логин/пароль наружу не отдаём.
+    cur = {}
+    for ln in _lines("/etc/gate/socks.conf"):
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            cur[k.strip()] = v.strip()
+    socks_current = ({"ip": cur.get("SOCKS_IP", ""), "port": cur.get("SOCKS_PORT", ""),
+                      "auth": bool(cur.get("SOCKS_USER"))}
+                     if cur.get("SOCKS_IP") else None)
+    return {"devices": devs, "socks_profiles": profs, "socks_current": socks_current,
             "pool": pool, "used": used,
             "vpn_live": (open("/etc/gate/vpn.state").read().strip() == "on"
                          if os.path.exists("/etc/gate/vpn.state") else False)}
@@ -561,6 +577,13 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
     <button id=so_on class=on onclick="act('global_socks_on',{profile:gsockVal()})">сделать основным</button>
     <button onclick="act('socks_test')">тест</button>
   </div>
+  <div class=row id=curSockRow style="margin-top:8px;display:none">
+    <span class=lbl>текущий носок:</span>
+    <span id=curSock class=muted></span>
+    <input id=promoName placeholder="имя профиля" size=10>
+    <button class=go onclick="promoteSocks()">сохранить как профиль</button>
+  </div>
+  <p class=muted>Повесить носок на КОНКРЕТНОЕ устройство можно только профилем — сохрани текущий под именем.</p>
 </div>
 
 <div class=card>
@@ -664,9 +687,16 @@ async function loadDevs(){var d=await api('/api/devices');if(!d)return;
   // список носков в селектор глобального выхода
   var gs=document.getElementById('gsock');
   if(gs){var cur=gs.value;gs.innerHTML='';
-    if(!d.socks_profiles.length){var o=document.createElement('option');o.value='';o.textContent='(нет профилей)';gs.appendChild(o)}
+    if(d.socks_current){var oc=document.createElement('option');oc.value='';
+      oc.textContent='текущий · '+d.socks_current.ip+':'+d.socks_current.port;gs.appendChild(oc)}
+    else if(!d.socks_profiles.length){var o=document.createElement('option');o.value='';o.textContent='(носков нет)';gs.appendChild(o)}
     d.socks_profiles.forEach(function(n){var o=document.createElement('option');o.value=n;o.textContent=n;gs.appendChild(o)});
     if(cur)gs.value=cur}
+  var row=document.getElementById('curSockRow'),lab=document.getElementById('curSock');
+  if(d.socks_current&&row){row.style.display='';
+    lab.textContent=d.socks_current.ip+':'+d.socks_current.port+(d.socks_current.auth?' (с авторизацией)':'')+
+      (d.socks_profiles.length?'':' — профиля нет, поэтому его не выбрать устройству')}
+  else if(row){row.style.display='none'}
   var box=document.getElementById('devs');box.innerHTML='';
   if(!d.devices.length){box.innerHTML='<span class=muted>нет активных аренд — подключи устройство к Wi-Fi</span>';return}
   d.devices.forEach(function(dev){
@@ -683,6 +713,9 @@ async function loadDevs(){var d=await api('/api/devices');if(!d)return;
     if(dev.target==='vpn'&&!d.vpn_live)note.textContent='⚠ VPN выключен → блок';
     else if(dev.ch)note.textContent='канал '+dev.ch;
     row.appendChild(lbl);row.appendChild(note);row.appendChild(sel);box.appendChild(row)})}
+function promoteSocks(){var n=(document.getElementById('promoName').value||'').trim();
+  if(!n){setOut('укажи имя профиля');return}
+  act('socks_promote',{name:n});document.getElementById('promoName').value=''}
 async function setDev(mac,target){
   setOut('… назначаю выход',true);
   var d=await api('/api/action',{method:'POST',
