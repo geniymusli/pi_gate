@@ -130,6 +130,60 @@ def _vpn_dns():
         return None
 
 
+# ─── Полосы (lanes): у клиента может быть СВОЙ выход ──────────────────────────
+# Механика: у inbound каждого хопа ДВЕ VLESS-идентичности с разными email —
+#   lane-main (uuid)   — обычная полоса, выход = прямой C2;
+#   lane-vpn  (uuid_b) — полоса «в туннель», выход = tun0/ppp0 на C2.
+# Малина выбирает полосу по IP КЛИЕНТА (routing.source) → коннектится к C1 нужным uuid.
+# Реле роутит по `user` (email авторизовавшегося клиента, xray UserMatcher) в соответствующий
+# outbound к C2. Выход так же по `user` шлёт либо в direct, либо в vpn-out.
+# Так признак полосы доживает от малины до C2 БЕЗ новых портов и без новых reality-ключей.
+LANE_MAIN = "lane-main"
+CLIENT_LANES = "/etc/gate/client-lanes.conf"   # <MAC> <IP> <канал> <выход> [имя] (пишет `gate client`)
+
+# КАНАЛЫ (безымянные полосы). У reality-inbound каждого хопа помимо основной идентичности
+# (hop.uuid, email lane-main) заводится пул одинаковых по смыслу каналов: hop.lane_uuids =
+# {"1": uuid, "2": uuid, ...}, email lane-1, lane-2… Канал сам по себе НИЧЕГО не значит —
+# он просто отдельная «труба» через цепочку. Чем канал заканчивается (прямой C2 / tun0 /
+# конкретный носок), решает ТОЛЬКО конфиг выхода C2, который собирает `gate` (exit_apply).
+# Поэтому добавить второй носок = поменять конфиг C2, БЕЗ передеплоя C1 и новых uuid.
+# Малина решает, какой клиент в какой канал, по source-IP (см. CLIENT_LANES).
+
+
+def lane_email(ch):
+    return "lane-" + str(ch)
+
+
+def _ch_key(ch):
+    return (0, int(ch)) if str(ch).isdigit() else (1, str(ch))
+
+
+def _channels(c):
+    """Каналы, заданные у ВСЕХ хопов. Частично заданный канал не отдаём: клиент ушёл бы
+    в несуществующую на каком-то хопе идентичность."""
+    names = set()
+    for h in c["hops"]:
+        names |= set((h.get("lane_uuids") or {}).keys())
+    out = [ch for ch in names if all((h.get("lane_uuids") or {}).get(ch) for h in c["hops"])]
+    return sorted(out, key=_ch_key)
+
+
+def _lane_ips():
+    """{канал: [IP клиентов]} из CLIENT_LANES. Нет файла / не назначено → пусто."""
+    m = {}
+    try:
+        for line in open(CLIENT_LANES):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            f = line.split()
+            if len(f) >= 4 and f[1] and f[2]:
+                m.setdefault(f[2], []).append(f[1])
+    except OSError:
+        pass
+    return m
+
+
 def _socks_on():
     try:
         return open(SOCKS_STATE).read().strip() == "on"
@@ -155,6 +209,16 @@ def _cap(key):
     return False
 
 
+def _lane_clients(hop):
+    """Клиенты reality-inbound хопа: основная идентичность + все каналы пула."""
+    cl = [{"id": hop["uuid"], "flow": "xtls-rprx-vision", "email": LANE_MAIN}]
+    for ch in sorted((hop.get("lane_uuids") or {}), key=_ch_key):
+        if hop["lane_uuids"][ch]:
+            cl.append({"id": hop["lane_uuids"][ch], "flow": "xtls-rprx-vision",
+                       "email": lane_email(ch)})
+    return cl
+
+
 def _reality_inbound(c, hop):
     """reality-in: то, что хоп показывает наружу (апстрим к нему коннектится)."""
     return {
@@ -163,7 +227,9 @@ def _reality_inbound(c, hop):
         "port": hop["port"],
         "protocol": "vless",
         "settings": {
-            "clients": [{"id": hop["uuid"], "flow": "xtls-rprx-vision"}],
+            # email — метка полосы: по нему роутинг ЭТОГО хопа решает, куда отдать трафик
+            # (см. LANE_MAIN/LANE_VPN). Вторая идентичность появляется только если задан uuid_b.
+            "clients": _lane_clients(hop),
             "decryption": "none",
         },
         "streamSettings": {
@@ -180,7 +246,7 @@ def _reality_inbound(c, hop):
     }
 
 
-def _reality_outbound(c, tag, dst, send_through=None):
+def _reality_outbound(c, tag, dst, send_through=None, lane_ch=None):
     """reality-out: коннект к следующему хопу dst по его inbound-идентичности.
     send_through (опц.) — IP источника на ЭТОМ хопе (xray sendThrough): если у хопа
     несколько IPv4, исходящее плечо к следующему хопу уходит именно с него."""
@@ -192,7 +258,8 @@ def _reality_outbound(c, tag, dst, send_through=None):
                 "address": dst["host"],
                 "port": dst["port"],
                 "users": [{
-                    "id": dst["uuid"],
+                    # lane_ch → коннектимся идентичностью канала, иначе основной
+                    "id": (dst.get("lane_uuids") or {})[lane_ch] if lane_ch else dst["uuid"],
                     "encryption": "none",
                     "flow": "xtls-rprx-vision",
                 }],
@@ -238,6 +305,17 @@ def render_pi(c):
     rules.append({"type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "blocked"})
     if not quic_through:
         rules.append({"type": "field", "network": "udp", "port": 443, "outboundTag": "blocked"})
+    # КАНАЛЫ: клиент с персональным выходом (`gate client <устройство> exit …`) уходит
+    # ОТДЕЛЬНЫМ каналом → C1 передаст канал дальше → C2 завершит его нужным выходом.
+    # Правила ДО общего catch-all ниже (порядок правил = приоритет); неназначенные идут
+    # основной идентичностью и получают ГЛОБАЛЬНЫЙ выход (gate global …).
+    lane_ips = _lane_ips()
+    outbounds = [_reality_outbound(c, "reality-s1", h0)]
+    for ch in _channels(c):
+        tag = "reality-s1-" + ch
+        outbounds.append(_reality_outbound(c, tag, h0, lane_ch=ch))
+        if lane_ips.get(ch):
+            rules.append({"type": "field", "source": lane_ips[ch], "outboundTag": tag})
     rules.append({"type": "field",
                   "inboundTag": ["tproxy-in", "socks-test"],
                   "outboundTag": "reality-s1"})
@@ -266,8 +344,7 @@ def render_pi(c):
                 "settings": {"udp": True},
             },
         ],
-        "outbounds": [
-            _reality_outbound(c, "reality-s1", h0),
+        "outbounds": outbounds + [
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "blocked", "protocol": "blackhole"},
         ],
@@ -280,17 +357,23 @@ def render_node(c, i):
     cfg = {"log": _log(), "inbounds": [_reality_inbound(c, hop)]}
     if role(c, i) == "relay":
         nxt = c["hops"][i + 1]
-        cfg["outbounds"] = [
-            _reality_outbound(c, "reality-out", nxt, send_through=hop.get("send_through")),
+        obs = [_reality_outbound(c, "reality-out", nxt, send_through=hop.get("send_through"))]
+        rules = []
+        # КАНАЛЫ: кто пришёл идентичностью lane-N — уходит к следующему хопу тем же каналом
+        # (его uuid). Признак — email клиента на НАШЕМ inbound (xray UserMatcher).
+        # Этот кусок статичен: смена выхода у канала конфиг реле НЕ трогает.
+        for ch in _channels(c):
+            tag = "reality-out-" + ch
+            obs.append(_reality_outbound(c, tag, nxt, send_through=hop.get("send_through"),
+                                         lane_ch=ch))
+            rules.append({"type": "field", "user": [lane_email(ch)],
+                          "inboundTag": ["reality-in"], "outboundTag": tag})
+        rules.append({"type": "field", "inboundTag": ["reality-in"], "outboundTag": "reality-out"})
+        cfg["outbounds"] = obs + [
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "blocked", "protocol": "blackhole"},
         ]
-        cfg["routing"] = {
-            "domainStrategy": "AsIs",
-            "rules": [
-                {"type": "field", "inboundTag": ["reality-in"], "outboundTag": "reality-out"},
-            ],
-        }
+        cfg["routing"] = {"domainStrategy": "AsIs", "rules": rules}
     else:  # exit
         direct = {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "AsIs"}}
         if hop.get("send_through"):
