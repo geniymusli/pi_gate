@@ -50,6 +50,20 @@ wait_iface(){
   return 1
 }
 
+# Снять openvpn ПОЛНОСТЬЮ, включая застрявший в запросе пароля.
+# Порядок важен: openvpn, ждущий systemd-ask-password, сидит в do_wait и до обработчика
+# сигналов НЕ доходит — SIGTERM его не берёт. Сначала убираем запрос пароля (освобождает
+# ожидание), потом мягко TERM, и лишь остатки — KILL. Плюс чистим очередь запросов systemd,
+# иначе *-ask-password-agent --wall возрождается и шлёт wall-сообщения в каждую сессию.
+kill_ovpn(){
+  pkill -9 -f "systemd-ask-password" 2>/dev/null || true
+  rm -f /run/systemd/ask-password/ask.* /run/systemd/ask-password/sck.* 2>/dev/null || true
+  systemctl stop systemd-ask-password-wall.service 2>/dev/null || true
+  pkill    -f "openvpn --config $DIR/client.ovpn" 2>/dev/null || true
+  sleep 1
+  pkill -9 -f "openvpn --config $DIR/client.ovpn" 2>/dev/null || true
+}
+
 up(){
   local t; t=$(vpn_type)
   [ -n "$t" ] || { echo "нет $DIR/type — сначала gate vpn set"; exit 1; }
@@ -62,8 +76,16 @@ up(){
   case "$t" in
     ovpn)
       [ -f "$DIR/client.ovpn" ] || { echo "нет $DIR/client.ovpn"; exit 1; }
-      pkill -f "openvpn --config $DIR/client.ovpn" 2>/dev/null; sleep 1
+      kill_ovpn   # снять прошлую попытку (в т.ч. зависшую на запросе пароля)
       local auth=""; [ -f "$DIR/auth.txt" ] && auth="--auth-user-pass $DIR/auth.txt"
+      # ГОЛЫЙ `auth-user-pass` (без файла) = сервер требует логин/пароль. Без auth.txt openvpn
+      # под --daemon НЕ падает, а спрашивает креды через systemd-ask-password --timeout=0 и
+      # ВИСНЕТ ВЕЧНО (ответить некому: демон, без tty). Ловим это ДО запуска — понятной ошибкой.
+      if [ -z "$auth" ] && grep -qE '^[[:space:]]*auth-user-pass[[:space:]]*$' "$DIR/client.ovpn"; then
+        echo "конфиг требует логин/пароль (auth-user-pass), но креды не заданы"
+        echo "  → задай так:  gate ovpn set <файл.ovpn> <логин> <пароль>"
+        exit 1
+      fi
       # up-хук: собрать push'нутые сервером dhcp-option DNS в общий накопитель (как usepeerdns
       # у pptp). С route-nopull опции всё равно приходят в foreign_option_* окружения скрипта.
       cat > "$DIR/ovpn-up.sh" <<'UP'
@@ -84,9 +106,20 @@ UP
       # это исключает: main-таблицу не трогаем вообще, дефолт в таблицу VPN ставит wait_iface.
       # Побочно делает безопасным прерывание `on` на полпути (main-роутинг C2 не меняется).
       # script-security 2 нужен, иначе up-хук не запустится и DNS не снимется.
+      # auth-retry nointeract: НИКОГДА не спрашивать креды интерактивно (демон, tty нет) —
+      # при нехватке/неверных кредах openvpn падает с ошибкой в лог, а не виснет навсегда.
       openvpn --config "$DIR/client.ovpn" $auth --route-nopull --route-noexec \
+        --auth-retry nointeract \
         --up "$DIR/ovpn-up.sh" --script-security 2 --log-append "$LOG" --daemon
-      sleep 3; wait_iface tun0 || { echo "tun0 не поднялся (см. $LOG)"; exit 1; }
+      sleep 3
+      if ! wait_iface tun0; then
+        echo "tun0 не поднялся (см. $LOG)"
+        # openvpn мог остаться жить и молотить реконнекты (resolv-retry infinite) — прибираем,
+        # иначе висит фоном до следующего `on` и путает диагностику.
+        kill_ovpn
+        echo "--- последние строки лога ---"; tail -12 "$LOG" 2>/dev/null
+        exit 1
+      fi
       ;;
     pptp)
       [ -f /etc/ppp/peers/gate-vpn ] || { echo "нет peer-файла pptp"; exit 1; }
@@ -113,7 +146,7 @@ HOOK
 }
 
 down(){
-  pkill -f "openvpn --config $DIR/client.ovpn" 2>/dev/null || true
+  kill_ovpn   # включая зависший на запросе пароля (обычный TERM его не берёт)
   pkill -f "pppd call gate-vpn" 2>/dev/null || true
   teardown_route
   echo "VPN down"
