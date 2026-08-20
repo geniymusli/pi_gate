@@ -145,6 +145,7 @@ def build_argv(action, p):
         "pptp_status":     ["pptp", "status"],
         # Каналы и персональные выходы устройств
         "client_list":     ["client", "list"],
+        "doctor":          ["doctor"],
         "lanes_status":    ["lanes", "status"],
         "lanes_apply":     ["lanes", "apply"],
         "osfp_off":        ["osfp", "off"],
@@ -176,6 +177,27 @@ def build_argv(action, p):
         else:
             raise ValueError("bad target")
         return ["client", mac, "exit", target]
+
+    if action == "client_name":
+        # своя подпись устройству (пустая = снять). Пробелы и кириллица разрешены —
+        # аргумент уходит в argv, без shell, так что экранировать нечего.
+        mac = (p.get("mac") or "").lower()
+        nm = (p.get("name") or "").strip()
+        if not re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac):
+            raise ValueError("bad mac")
+        if len(nm) > 32 or any(c in nm for c in "\r\n\t"):
+            raise ValueError("bad name")
+        return ["client", mac, "name"] + ([nm] if nm else [])
+
+    if action == "dns_lane":
+        tgt = p.get("target", "")
+        ips = (p.get("ips") or "").strip()
+        if tgt not in ("c2", "vpn") and not (tgt.startswith("socks:") and NAME_RE.match(tgt[6:])):
+            raise ValueError("bad lane")
+        parts = [x.strip() for x in ips.split(",") if x.strip()]
+        if not parts or len(parts) > 4 or not all(valid_ip(x) for x in parts):
+            raise ValueError("bad resolvers")
+        return ["dns", "lane", tgt, ",".join(parts)]
 
     if action == "socks_promote":
         n = p.get("name", "")
@@ -330,6 +352,12 @@ def read_devices():
         f = ln.split()
         if len(f) >= 4:
             assigned[f[0].lower()] = {"ch": f[2], "target": f[3]}
+    # свои подписи: <MAC> <подпись с пробелами>
+    labels = {}
+    for ln in _lines("/etc/gate/client-names.conf"):
+        parts = ln.split(None, 1)
+        if len(parts) == 2:
+            labels[parts[0].lower()] = parts[1]
     devs, seen = [], set()
     # аренды dnsmasq: <expiry> <mac> <ip> <hostname> <clientid>
     for ln in _lines("/var/lib/misc/dnsmasq.leases"):
@@ -342,6 +370,7 @@ def read_devices():
             a = assigned.get(mac)
             devs.append({"mac": mac, "ip": ip,
                          "name": (f[3] if len(f) > 3 and f[3] != "*" else ""),
+                         "label": labels.get(mac, ""),
                          "target": (a or {}).get("target", ""),
                          "ch": (a or {}).get("ch", "")})
     # профили носков
@@ -373,7 +402,25 @@ def read_devices():
     socks_current = ({"ip": cur.get("SOCKS_IP", ""), "port": cur.get("SOCKS_PORT", ""),
                       "auth": bool(cur.get("SOCKS_USER"))}
                      if cur.get("SOCKS_IP") else None)
+    # резолвер каждой полосы (явная настройка → пушнутые для vpn → dnscrypt для c2)
+    explicit = {}
+    for ln in _lines("/etc/gate/lane-dns.conf"):
+        f = ln.split()
+        if len(f) >= 2:
+            explicit[f[0]] = f[1]
+    vpn_pushed = ",".join(_lines("/etc/gate/vpn-dns"))
+    lane_dns = {}
+    for t in set(["c2", "vpn"] + [v["target"] for v in assigned.values()]):
+        if explicit.get(t):
+            lane_dns[t] = explicit[t]
+        elif t == "vpn":
+            lane_dns[t] = vpn_pushed
+        elif t == "c2":
+            lane_dns[t] = "10.53.0.1 (dnscrypt, шифрованный)"
+        else:
+            lane_dns[t] = "9.9.9.9,149.112.112.112"
     return {"devices": devs, "socks_profiles": profs, "socks_current": socks_current,
+            "lane_dns": lane_dns,
             "pool": pool, "used": used,
             "vpn_live": (open("/etc/gate/vpn.state").read().strip() == "on"
                          if os.path.exists("/etc/gate/vpn.state") else False)}
@@ -592,7 +639,21 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
   </h2>
   <p class=muted>Ноут прямым C2, один телефон через VPN, другой — через свой носок. Одновременно.</p>
   <div id=devs class=plist><span class=muted>загрузка…</span></div>
-  <p class=muted>Если выход устройства выключен, его трафик блокируется (fail-closed), а не идёт мимо назначения.</p>
+  <p class=muted>Подпись можно менять прямо в поле — она сохраняется за MAC и переживает переподключения.
+     Если выход устройства выключен, его трафик блокируется (fail-closed), а не идёт мимо назначения.</p>
+  <div class=row style="margin-top:8px">
+    <span class=lbl>пул каналов:</span>
+    <input id=poolN size=3 value=4>
+    <button onclick="act('lanes_init',{n:document.getElementById('poolN').value})">пересоздать</button>
+    <button onclick="act('lanes_apply')">применить раскладку</button>
+  </div>
+</div>
+
+<div class=card>
+  <h2>DNS по полосам</h2>
+  <p class=muted>У каждой полосы свой резолвер, и запрос уходит ЕЁ ЖЕ полосой — поэтому страна DNS
+     совпадает с выходом устройства.</p>
+  <div id=lanedns class=plist><span class=muted>загрузка…</span></div>
 </div>
 
 <div class=card>
@@ -650,6 +711,7 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
     <button class=on onclick="act('tunnel_up')">tunnel up</button>
     <button class=off onclick="act('tunnel_down')">tunnel down</button>
     <button onclick="act('tunnel_status')">статус</button>
+    <button class=go onclick="act('doctor')">doctor (проверить и починить)</button>
     <button class=danger onclick="doWipe()">очистка (wipe)</button>
   </div>
 </div>
@@ -701,8 +763,14 @@ async function loadDevs(){var d=await api('/api/devices');if(!d)return;
   if(!d.devices.length){box.innerHTML='<span class=muted>нет активных аренд — подключи устройство к Wi-Fi</span>';return}
   d.devices.forEach(function(dev){
     var row=document.createElement('div');row.className='pitem';
-    var title=(dev.name||dev.mac)+' · '+dev.ip;
-    var lbl=document.createElement('b');lbl.textContent=title;
+    // подпись — редактируемая; сохраняем по Enter или уходу фокуса
+    var nm=document.createElement('input');nm.size=14;nm.placeholder='подпись';
+    nm.value=dev.label||dev.name||'';
+    nm.onkeydown=function(e){if(e.key==='Enter')nm.blur()};
+    nm.onchange=function(){setName(dev.mac,nm.value)};
+    var meta=document.createElement('b');
+    meta.style.fontWeight='400';
+    meta.innerHTML='<span class=muted>'+dev.ip+' · '+dev.mac+'</span>';
     var sel=document.createElement('select');
     var opts=[['','по умолчанию'],['c2','прямой C2'],['vpn','VPN (tun0 на C2)']];
     d.socks_profiles.forEach(function(n){opts.push(['socks:'+n,'носок «'+n+'»'])});
@@ -712,10 +780,28 @@ async function loadDevs(){var d=await api('/api/devices');if(!d)return;
     var note=document.createElement('span');note.className='muted';
     if(dev.target==='vpn'&&!d.vpn_live)note.textContent='⚠ VPN выключен → блок';
     else if(dev.ch)note.textContent='канал '+dev.ch;
-    row.appendChild(lbl);row.appendChild(note);row.appendChild(sel);box.appendChild(row)})}
+    row.appendChild(nm);row.appendChild(meta);row.appendChild(note);row.appendChild(sel);
+    box.appendChild(row)});
+  // резолверы полос
+  var lb=document.getElementById('lanedns');
+  if(lb){lb.innerHTML='';
+    var names={c2:'прямой C2',vpn:'VPN-туннель'};
+    Object.keys(d.lane_dns||{}).sort().forEach(function(t){
+      var r=document.createElement('div');r.className='pitem';
+      var n=document.createElement('b');n.textContent=names[t]||t;
+      var cur=document.createElement('span');cur.className='muted';cur.textContent=d.lane_dns[t]||'—';
+      var inp=document.createElement('input');inp.size=16;inp.placeholder='ip,ip';
+      var b=document.createElement('button');b.textContent='задать';b.className='go';
+      b.onclick=function(){if(inp.value.trim())act('dns_lane',{target:t,ips:inp.value.trim()})};
+      r.appendChild(n);r.appendChild(cur);r.appendChild(inp);r.appendChild(b);lb.appendChild(r)})}}
 function promoteSocks(){var n=(document.getElementById('promoName').value||'').trim();
   if(!n){setOut('укажи имя профиля');return}
   act('socks_promote',{name:n});document.getElementById('promoName').value=''}
+async function setName(mac,name){
+  setOut('… подпись',true);
+  var d=await api('/api/action',{method:'POST',body:JSON.stringify({action:'client_name',mac:mac,name:name})});
+  if(!d)return; if(d.error){setOut('ошибка: '+d.error);return}
+  setOut(d.out||('код '+d.code));loadDevs()}
 async function setDev(mac,target){
   setOut('… назначаю выход',true);
   var d=await api('/api/action',{method:'POST',

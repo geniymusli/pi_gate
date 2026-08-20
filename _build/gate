@@ -596,6 +596,10 @@ cmd_clients(){
 # Привязка к MAC, а IP закрепляется бронью dnsmasq — иначе после переподключения телефон
 # получил бы другой адрес и тихо ушёл на глобальный выход.
 CLIENT_LANES="/etc/gate/client-lanes.conf"     # <MAC> <IP> <канал> <выход> [имя]
+# Свои подписи устройствам: <MAC> <подпись с пробелами>. Отдельно от раскладки полос,
+# потому что подписать хочется и НЕназначенное устройство, а имя из DHCP часто пустое
+# или бесполезное (у iPhone с приватным адресом его вообще нет).
+CLIENT_NAMES="/etc/gate/client-names.conf"
 LANES_DHCP="/etc/dnsmasq.d/gate-lanes.conf"    # брони IP + ПЕРСОНАЛЬНЫЙ резолвер каждой полосе
 # Резолвер для полос, чей выход НЕ туннель (прямой C2, носок). Плейн-DNS, но он едет
 # ВНУТРИ цепочки до выхода — снаружи виден только IP выхода, как у обычного юзера.
@@ -730,8 +734,44 @@ used=set(sys.stdin.read().split())
 free=sorted(ch-used, key=lambda x:(0,int(x)) if x.isdigit() else (1,x))
 print(free[0] if free else '')" <<<"$used" 2>/dev/null
 }
-lane_find(){      # $1 = IP | MAC | имя  →  "MAC IP ИМЯ" из аренд dnsmasq
-  local q; q="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+# Выравнивание колонок по СИМВОЛАМ: printf в bash считает байты, а кириллица — 2 байта
+# на символ, из-за чего таблица с русскими подписями разъезжается.
+pad(){ local s="$1" w="$2" n sp
+  n="$(LC_ALL=C.UTF-8 printf '%s' "$s" | LC_ALL=C.UTF-8 wc -m 2>/dev/null || printf '%s' "${#s}")"
+  sp=$(( w - n )); [ "$sp" -lt 1 ] && sp=1
+  printf '%s%*s' "$s" "$sp" ""
+}
+
+client_label(){   # своя подпись по MAC (пусто, если не задана)
+  local m; m="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  awk -v m="$m" '!/^#/ && tolower($1)==m {$1=""; sub(/^[ \t]+/,""); print; exit}' \
+    "$CLIENT_NAMES" 2>/dev/null
+}
+client_label_set(){   # $1=MAC, дальше подпись (пусто = снять)
+  local m; m="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"; shift
+  local lbl="$*"
+  sudo touch "$CLIENT_NAMES"
+  sudo sed -i "/^$m[[:space:]]/Id" "$CLIENT_NAMES"
+  [ -n "$lbl" ] && printf '%s %s\n' "$m" "$lbl" | sudo tee -a "$CLIENT_NAMES" >/dev/null
+  return 0
+}
+# Как показывать устройство: своя подпись → имя из DHCP → прочерк
+client_show(){    # $1=MAC $2=имя_из_аренды
+  local l; l="$(client_label "$1")"
+  if [ -n "$l" ]; then printf '%s' "$l"
+  elif [ -n "${2:-}" ] && [ "$2" != "*" ]; then printf '%s' "$2"
+  else printf '—'; fi
+}
+
+lane_find(){      # $1 = IP | MAC | своя подпись | имя из DHCP  →  "MAC IP ИМЯ"
+  local q; q="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" m=""
+  # сперва по своей подписи (её юзер и держит в голове)
+  m="$(awk -v q="$q" '!/^#/ {mac=$1; $1=""; sub(/^[ \t]+/,""); if (tolower($0)==q) {print tolower(mac); exit}}' \
+       "$CLIENT_NAMES" 2>/dev/null)"
+  if [ -n "$m" ]; then
+    awk -v m="$m" '{if(tolower($2)==m){print tolower($2)" "$3" "$4; exit}}' "$DHCP_LEASES" 2>/dev/null
+    return
+  fi
   awk -v q="$q" '{if(tolower($2)==q||$3==q||($4!=""&&tolower($4)==q)){print tolower($2)" "$3" "$4; exit}}' \
     "$DHCP_LEASES" 2>/dev/null
 }
@@ -782,24 +822,25 @@ lane_list(){
     printf "%s│%s каналы: %s не созданы — %sgate lanes init%s\n" "$CYA" "$R" "$(bad)" "$YEL" "$R"
   fi
   printf "%s├───────────────────────────────────────────────────────────%s\n" "$CYA" "$R"
-  printf "%s│%s %-15s %-17s %-12s %s\n" "$CYA" "$R" "IP" "MAC" "Имя" "Выход"
-  local any=0 mac ip name e c
+  printf "%s│%s %s%s%s%s\n" "$CYA" "$R" "$(pad IP 16)" "$(pad MAC 19)" "$(pad Подпись 16)" "Выход"
+  local any=0 mac ip name e c lbl
   while read -r _ mac ip name _; do
     [ -z "$ip" ] && continue
-    any=1; e="$(lane_of "$mac")"
+    any=1; e="$(lane_of "$mac")"; lbl="$(client_show "$mac" "$name")"
     if [ -z "$e" ]; then
-      printf "%s│%s %-15s %-17s %-12s %s%s%s\n" "$CYA" "$R" "$ip" "$mac" "${name:-—}" \
+      printf "%s│%s %s%s%s%s%s%s\n" "$CYA" "$R" "$(pad "$ip" 16)" "$(pad "$mac" 19)" "$(pad "$lbl" 16)" \
         "$D" "по умолчанию → $(global_label)" "$R"
     else
       exit_spec_live "$e" && c="$GRN" || c="$RED"
-      printf "%s│%s %-15s %-17s %-12s %s%s%s%s\n" "$CYA" "$R" "$ip" "$mac" "${name:-—}" \
+      printf "%s│%s %s%s%s%s%s%s%s\n" "$CYA" "$R" "$(pad "$ip" 16)" "$(pad "$mac" 19)" "$(pad "$lbl" 16)" \
         "$c" "$(exit_label_spec "$e")" "$R" \
         "$(exit_spec_live "$e" || printf ' %s(выход выключен → трафик блокирован)%s' "$YEL" "$R")"
     fi
   done < "$DHCP_LEASES" 2>/dev/null
   [ "$any" = 0 ] && printf "%s│%s %sнет аренд — подключи устройство к AP%s\n" "$CYA" "$R" "$GRY" "$R"
   printf "%s└───────────────────────────────────────────────────────────%s\n" "$CYA" "$R"
-  printf "%s  назначить: gate client <ip|mac|имя> exit c2|vpn|socks:<профиль>%s\n" "$D" "$R"
+  printf "%s  назначить: gate client <ip|mac|подпись> exit c2|vpn|socks:<профиль>%s\n" "$D" "$R"
+  printf "%s  подписать: gate client <ip|mac> name <как назвать>%s\n" "$D" "$R"
   printf "%s  вернуть на глобальный: gate client <…> exit auto%s\n\n" "$D" "$R"
 }
 
@@ -825,14 +866,26 @@ lanes_dhcp_write(){
 cmd_client(){
   case "${1:-list}" in ""|list|status) lane_list; return 0 ;; esac
   local who="$1" verb="${2:-}" val="${3:-}"
+  # подпись устройства: gate client <кто> name <как назвать>   (без слов — снять подпись)
+  if [ "$verb" = name ]; then
+    local f; f="$(lane_find "$who")"
+    [ -n "$f" ] || { echo "Не нашёл '$who' среди аренд DHCP — посмотри ${YEL}gate clients${R}"; return 1; }
+    local m; m="$(printf '%s' "$f" | awk '{print $1}')"
+    shift 2
+    client_label_set "$m" "$@"
+    if [ -n "$*" ]; then echo "Подпись: ${GRN}$*${R}  ${D}($m)${R}"
+    else echo "Подпись снята ${D}($m)${R}"; fi
+    return 0
+  fi
   [ "$verb" = exit ] && [ -n "$val" ] || {
-    echo "gate client {list | <ip|mac|имя> exit <c2|vpn|socks:профиль|auto>}"; return 1; }
+    echo "gate client {list | <ip|mac|подпись> exit <c2|vpn|socks:профиль|auto> | <ip|mac> name <подпись>}"; return 1; }
   local found; found="$(lane_find "$who")"
   [ -n "$found" ] || { echo "Не нашёл '$who' среди аренд DHCP — посмотри ${YEL}gate clients${R}"; return 1; }
   local mac ip name
   mac="$(printf '%s' "$found" | awk '{print $1}')"
   ip="$(printf '%s' "$found"  | awk '{print $2}')"
   name="$(printf '%s' "$found"| awk '{print $3}')"
+  name="$(client_show "$mac" "$name")"
   sudo touch "$CLIENT_LANES" "$LANES_DHCP"
   local before; before="$(lane_any_count)"
   if [ "$val" = auto ] || [ "$val" = default ]; then
@@ -2480,7 +2533,8 @@ ${hr}━━ ОБЗОР ━━━━━━━━━━━━━━━━━━━
   ${g}gate info${R}                    полный статус роутера
   ${g}gate clients${R}                 устройства в раздаче
   ${g}gate client list${R}             кто на каком выходе (полосы)
-  ${g}gate client <ip|mac|имя> exit <c2|vpn|socks:профиль|auto>${R}  ${D}персональный выход${R}
+  ${g}gate client <ip|mac|подпись> exit <c2|vpn|socks:профиль|auto>${R}  ${D}персональный выход${R}
+  ${g}gate client <ip|mac> name <подпись>${R}  своя подпись устройству
   ${g}gate lanes {init [N]|status|apply}${R}  пул каналов для персональных выходов
   ${g}gate dns lane [<выход> <ip,ip>]${R}  резолвер полосы (свой DNS каждому выходу)
   ${g}gate global {ovpn|pptp|socks [проф]} on${R}  выход по умолчанию для всех
