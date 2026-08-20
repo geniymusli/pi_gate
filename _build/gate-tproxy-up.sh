@@ -45,6 +45,8 @@ HOP_IPS="$(python3 -c "import json;print(' '.join(h['host'] for h in json.load(o
 # ЗАВОРАЧИВАЕМ в tproxy → цепочка → C2 → ppp0 → форвардер ISP. Так клиентский DNS резидентный.
 # может быть НЕСКОЛЬКО резолверов (по одному в строке) — заворачиваем каждый
 VPN_DNS="$(cat /etc/gate/vpn-dns 2>/dev/null | tr '\n' ' ' || true)"
+# IP клиентов с персональным выходом (<MAC> <IP> <канал> <выход> [имя]) — их DNS идёт в полосу
+LANE_CLIENTS="$(awk '!/^#/ && NF>=4 {print $2}' /etc/gate/client-lanes.conf 2>/dev/null | tr '\n' ' ')"
 
 # приватные/служебные сети, которые НЕ заворачиваем (клиенты и сама малина)
 PRIV="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
@@ -94,7 +96,16 @@ for d in $VPN_DNS; do
   iptables -t mangle -A GATE_TP -d "$d" -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
 done
 for n in $PRIV; do iptables -t mangle -A GATE_TP -d "$n" -j RETURN; done
-# Force-DNS: клиентский :53 не отдаём в tproxy — его перехватит nat DNAT (ниже)
+# Клиенты с ПЕРСОНАЛЬНЫМ выходом (gate client … exit …): их :53 идёт в СВОЮ полосу, а не в
+# локальный резолвер. Иначе DNS у всех уходил бы одной полосой и страна резолвера не
+# совпадала бы с выходом устройства (ноут на C2 получал бы DNS американского провайдера).
+# Правило ДО общего RETURN ниже — порядок в цепочке решает. Резолвер им раздаёт DHCP
+# (dnsmasq tag:laneN), см. lanes_dhcp_write в `gate`.
+for cip in $LANE_CLIENTS; do
+  iptables -t mangle -A GATE_TP -i "$AP_IF" -s "$cip" -p udp --dport 53     -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
+  iptables -t mangle -A GATE_TP -i "$AP_IF" -s "$cip" -p tcp --dport 53     -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
+done
+# Force-DNS для ОСТАЛЬНЫХ: их :53 не отдаём в tproxy — перехватит nat DNAT (ниже)
 iptables -t mangle -A GATE_TP -i "$AP_IF" -p udp --dport 53 -j RETURN
 iptables -t mangle -A GATE_TP -i "$AP_IF" -p tcp --dport 53 -j RETURN
 # перехват всего остального TCP+UDP
@@ -120,6 +131,10 @@ iptables -t mangle -A GATE_TP_LOCAL -p udp -j MARK --set-mark "$MARK_TP"
 iptables -t nat -F GATE_DNS 2>/dev/null || true
 iptables -t nat -N GATE_DNS 2>/dev/null || true
 iptables -t nat -C PREROUTING -j GATE_DNS 2>/dev/null || iptables -t nat -A PREROUTING -j GATE_DNS
+# назначенные клиенты в DNAT НЕ попадают: их DNS уже ушёл в свою полосу (mangle выше)
+for cip in $LANE_CLIENTS; do
+  iptables -t nat -A GATE_DNS -i "$AP_IF" -s "$cip" -j RETURN
+done
 iptables -t nat -A GATE_DNS -i "$AP_IF" -p udp --dport 53 -j DNAT --to-destination "$AP_ADDR:53"
 iptables -t nat -A GATE_DNS -i "$AP_IF" -p tcp --dport 53 -j DNAT --to-destination "$AP_ADDR:53"
 

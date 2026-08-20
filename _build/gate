@@ -596,7 +596,27 @@ cmd_clients(){
 # Привязка к MAC, а IP закрепляется бронью dnsmasq — иначе после переподключения телефон
 # получил бы другой адрес и тихо ушёл на глобальный выход.
 CLIENT_LANES="/etc/gate/client-lanes.conf"     # <MAC> <IP> <канал> <выход> [имя]
-LANES_DHCP="/etc/dnsmasq.d/gate-lanes.conf"    # dhcp-host=<MAC>,<IP> — закрепление адреса
+LANES_DHCP="/etc/dnsmasq.d/gate-lanes.conf"    # брони IP + ПЕРСОНАЛЬНЫЙ резолвер каждой полосе
+# Резолвер для полос, чей выход НЕ туннель (прямой C2, носок). Плейн-DNS, но он едет
+# ВНУТРИ цепочки до выхода — снаружи виден только IP выхода, как у обычного юзера.
+# Для полосы vpn резолверы берём из /etc/gate/vpn-dns (их пушит сам VPN-сервер).
+# ВАЖНО: публичные резолверы — anycast, и «страна резолвера» зависит от того, откуда к нему
+# пришли. С одного и того же выхода Quad9 может отвечать Швецией, Cloudflare — Нидерландами,
+# а Google — страной выхода. Поэтому резолвер полосы ПОДБИРАЕТСЯ ЗАМЕРОМ и настраивается:
+#   gate dns lane <выход> <ip[,ip]>     (выход: c2 | socks:<профиль>)
+LANE_DNS_CONF="/etc/gate/lane-dns.conf"        # строки: <выход> <ip[,ip]>
+LANE_DNS_DEFAULT="${LANE_DNS_DEFAULT:-9.9.9.9,149.112.112.112}"
+
+# Резолверы конкретной полосы: явная настройка → пушнутые (для vpn) → дефолт
+lane_dns_for(){
+  local tgt="$1" v
+  v="$(awk -v t="$tgt" '!/^#/ && $1==t {print $2; exit}' "$LANE_DNS_CONF" 2>/dev/null)"
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  case "$tgt" in
+    vpn) paste -sd, /etc/gate/vpn-dns 2>/dev/null ;;
+    *)   printf '%s' "$LANE_DNS_DEFAULT" ;;
+  esac
+}
 GLOBAL_EXIT="/etc/gate/global-exit.conf"       # GLOBAL=c2|ovpn|pptp|socks  GLOBAL_SOCKS=<профиль>
 
 # Каналы готовы, только если пул есть у ВСЕХ хопов
@@ -718,6 +738,24 @@ lane_list(){
   printf "%s  вернуть на глобальный: gate client <…> exit auto%s\n\n" "$D" "$R"
 }
 
+# Пересобрать раздачу DHCP для назначенных устройств: закрепление IP + СВОЙ резолвер.
+# Зачем свой резолвер: DNS должен уходить ТОЙ ЖЕ полосой, что и трафик, иначе страна
+# резолвера не совпадает с выходом (ноут на C2 ходил бы с DNS американского провайдера).
+# Запросы этих клиентов НЕ заворачиваются в локальный dnsmasq (см. gate-tproxy-up.sh):
+# они идут в свою полосу и наружу выходят её выходом — резолвер видит именно его.
+lanes_dhcp_write(){
+  {
+    echo "# Пишет gate client — не править руками (перезаписывается)"
+    local mac ip ch tgt name dns
+    while read -r mac ip ch tgt name; do
+      [ -n "$mac" ] || continue
+      dns="$(lane_dns_for "$tgt")"
+      echo "dhcp-host=$mac,$ip,set:lane$ch"
+      [ -n "$dns" ] && echo "dhcp-option=tag:lane$ch,option:dns-server,$dns"
+    done < <(lane_rows)
+  } | sudo tee "$LANES_DHCP" >/dev/null
+}
+
 cmd_client(){
   case "${1:-list}" in ""|list|status) lane_list; return 0 ;; esac
   local who="$1" verb="${2:-}" val="${3:-}"
@@ -733,7 +771,6 @@ cmd_client(){
   local before; before="$(lane_any_count)"
   if [ "$val" = auto ] || [ "$val" = default ]; then
     sudo sed -i "/^$mac[[:space:]]/d" "$CLIENT_LANES"
-    sudo sed -i "/^dhcp-host=$mac,/d" "$LANES_DHCP"
     echo "→ ${GRN}${name:-$mac}${R} ($ip) → по умолчанию (${GRN}$(global_label)${R})"
   else
     exit_spec_ok "$val" || return 1
@@ -750,15 +787,15 @@ cmd_client(){
                         echo "     ${D}увеличить:${R} gate lanes init <сколько>"; return 1; }
     fi
     sudo sed -i "/^$mac[[:space:]]/d" "$CLIENT_LANES"
-    sudo sed -i "/^dhcp-host=$mac,/d" "$LANES_DHCP"
     echo "$mac $ip $ch $val ${name:-—}" | sudo tee -a "$CLIENT_LANES" >/dev/null
-    # закрепляем адрес за MAC: иначе после реконнекта IP сменится и привязка соскочит
-    echo "dhcp-host=$mac,$ip" | sudo tee -a "$LANES_DHCP" >/dev/null
     echo "→ ${YEL}${name:-$mac}${R} ($ip) → ${YEL}$(exit_label_spec "$val")${R} ${D}(канал $ch)${R}; адрес закреплён"
   fi
+  lanes_dhcp_write
   sudo systemctl restart dnsmasq 2>/dev/null
   echo "→ Применяю на малине…"
   render_pi_apply || return 1
+  # tproxy знает, чьи :53 пускать в свою полосу мимо локального резолвера
+  tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
   echo "→ Пересобираю конфиг выхода на C2…"
   exit_apply >/dev/null || echo "  ${YEL}⚠ конфиг выхода не применился — проверь gate exit${R}"
   if [ "$val" != auto ] && [ "$val" != default ] && ! exit_spec_live "$val"; then
@@ -869,7 +906,9 @@ PYEOF
     apply)
       lanes_enabled || { echo "  ${RED}✗ каналы не созданы${R} — ${YEL}gate lanes init${R}"; return 1; }
       echo "→ Применяю раскладку каналов на малине…"
+      lanes_dhcp_write; sudo systemctl restart dnsmasq 2>/dev/null
       render_pi_apply || return 1
+      tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
       echo "→ Применяю конфиг выхода на C2…"
       exit_apply >/dev/null || { echo "  ${RED}✗ конфиг выхода не применился${R}"; return 1; }
       lane_list ;;
@@ -1331,10 +1370,46 @@ dns_resolver_set(){
     echo "  ${RED}✗ dnscrypt-proxy не поднялся${R} — бэкап рядом: $DNSCRYPT_TOML.bak-*"
   fi
 }
+# Резолвер конкретной полосы: gate dns lane [<выход> [<ip[,ip]>]]
+# Подбирать замером: у anycast-резолверов «страна» зависит от того, откуда к ним пришли,
+# поэтому один и тот же 9.9.9.9 с разных выходов даёт разные страны.
+dns_lane_set(){
+  local tgt="${1:-}" val="${2:-}"
+  if [ -z "$tgt" ]; then
+    printf "\nРезолверы полос:\n"
+    printf "  %-16s %s\n" "vpn" "$(lane_dns_for vpn)  ${D}(пушит VPN-сервер)${R}"
+    printf "  %-16s %s\n" "c2" "$(lane_dns_for c2)"
+    local t
+    for t in $(lane_rows | awk '$4 ~ /^socks:/ {print $4}' | sort -u); do
+      printf "  %-16s %s\n" "$t" "$(lane_dns_for "$t")"
+    done
+    printf "  ${D}задать: gate dns lane <c2|socks:профиль|vpn> <ip[,ip]>${R}\n"
+    printf "  ${D}проверить, какой страны резолвер: gate dns${R}\n\n"
+    return 0
+  fi
+  case "$tgt" in
+    c2|vpn|socks:*) ;;
+    *) echo "Выход: ${GRN}c2${R} · ${YEL}vpn${R} · ${YEL}socks:<профиль>${R}"; return 1 ;;
+  esac
+  [ -n "$val" ] || { echo "gate dns lane $tgt <ip[,ip]>"; return 1; }
+  local ip
+  for ip in ${val//,/ }; do
+    printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || { echo "  ${RED}✗ не IP: $ip${R}"; return 1; }
+  done
+  sudo touch "$LANE_DNS_CONF"
+  sudo sed -i "\|^$tgt[[:space:]]|d" "$LANE_DNS_CONF"
+  echo "$tgt $val" | sudo tee -a "$LANE_DNS_CONF" >/dev/null
+  echo "Резолвер полосы ${YEL}$tgt${R} → ${GRN}$val${R}"
+  lanes_dhcp_write; sudo systemctl restart dnsmasq 2>/dev/null
+  tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
+  echo "  ${D}устройствам нужно переподключиться к Wi-Fi, чтобы забрать новый DNS${R}"
+}
+
 cmd_dns(){
   case "${1:-}" in
     fallback) shift; dns_fallback_set "$@"; return ;;
     resolver) shift; dns_resolver_set "$@"; return ;;
+    lane)     shift; dns_lane_set "$@"; return ;;
   esac
   local n="${1:-4}"; [[ "$n" =~ ^[0-9]+$ ]] || n=4
   local jget='import sys,json
@@ -2340,6 +2415,7 @@ ${hr}━━ ОБЗОР ━━━━━━━━━━━━━━━━━━━
   ${g}gate client list${R}             кто на каком выходе (полосы)
   ${g}gate client <ip|mac|имя> exit <c2|vpn|socks:профиль|auto>${R}  ${D}персональный выход${R}
   ${g}gate lanes {init [N]|status|apply}${R}  пул каналов для персональных выходов
+  ${g}gate dns lane [<выход> <ip,ip>]${R}  резолвер полосы (свой DNS каждому выходу)
   ${g}gate global {ovpn|pptp|socks [проф]} on${R}  выход по умолчанию для всех
   ${g}gate global off${R}                 вернуть всех на прямой C2
   ${g}gate traffic [iface]${R}         живой трафик ↓↑ до Ctrl+C
