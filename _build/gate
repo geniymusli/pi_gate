@@ -605,6 +605,12 @@ LANES_DHCP="/etc/dnsmasq.d/gate-lanes.conf"    # брони IP + ПЕРСОНА�
 # а Google — страной выхода. Поэтому резолвер полосы ПОДБИРАЕТСЯ ЗАМЕРОМ и настраивается:
 #   gate dns lane <выход> <ip[,ip]>     (выход: c2 | socks:<профиль>)
 LANE_DNS_CONF="/etc/gate/lane-dns.conf"        # строки: <выход> <ip[,ip]>
+# Адрес, на котором dnscrypt обслуживает КЛИЕНТОВ полосы прямого C2 (шифрованный DoH).
+# ВНЕ AP-подсети и вне AP-интерфейса СПЕЦИАЛЬНО: dnsmasq поднят с bind-interfaces и занимает
+# ВСЕ адреса wlan1 — вторичный адрес на нём отобрал бы у него порт 53 и dnsmasq не стартовал.
+# Держим его на lo: клиент шлёт на 10.53.0.1, пакет уходит на шлюз (малину), а у неё адрес
+# локальный → дойдёт до dnscrypt. Приватные адреса tproxy пропускает мимо туннеля.
+AP_DNS_ADDR="${AP_DNS_ADDR:-10.53.0.1}"
 LANE_DNS_DEFAULT="${LANE_DNS_DEFAULT:-9.9.9.9,149.112.112.112}"
 
 # Резолверы конкретной полосы: явная настройка → пушнутые (для vpn) → дефолт
@@ -614,8 +620,67 @@ lane_dns_for(){
   [ -n "$v" ] && { printf '%s' "$v"; return; }
   case "$tgt" in
     vpn) paste -sd, /etc/gate/vpn-dns 2>/dev/null ;;
+    c2)  printf '%s' "$AP_DNS_ADDR" ;;   # dnscrypt малины, выход — прямой C2 (см. lanes_self_route)
     *)   printf '%s' "$LANE_DNS_DEFAULT" ;;
   esac
+}
+
+# dnscrypt должен слушать и на AP_DNS_ADDR:53, иначе клиенты полосы C2 до него не достучатся.
+# Две тонкости:
+#  • сервис бежит под _dnscrypt-proxy и НЕ может занять порт <1024 → выдаём ровно одну
+#    привилегию CAP_NET_BIND_SERVICE (не root!);
+#  • адрес вторичный и появляется позже (его ставит gate-tproxy-up.sh) → разрешаем
+#    ip_nonlocal_bind, иначе на буте гонка «сервис стартовал раньше адреса» = FATAL.
+dnscrypt_listen_ensure(){
+  local t="$DNSCRYPT_TOML" d=/etc/systemd/system/dnscrypt-proxy.service.d/20-gate-bind.conf
+  sudo test -f "$t" || return 0
+  local changed=0
+  if ! grep -q "$AP_DNS_ADDR:53" "$t" 2>/dev/null; then
+    sudo sed -i "s|^listen_addresses = \[\(.*\)\]|listen_addresses = [\1, '$AP_DNS_ADDR:53']|" "$t"
+    changed=1
+  fi
+  # И на loopback:53 — это резолвер САМОЙ малины. Раньше она спрашивала dnsmasq, а тот
+  # ходит к резолверам глобального выхода; когда трафик малины поехал каналом C2, её
+  # запросы к «американскому» резолверу туннеля перестали доходить (он обслуживает только
+  # своих) → у малины пропал DNS. Теперь она резолвит через свой dnscrypt, тем же путём,
+  # каким сама выходит. 127.0.0.2 всегда существует и не зависит от AP-интерфейса.
+  if ! grep -q "127.0.0.2:53" "$t" 2>/dev/null; then
+    sudo sed -i "s|^listen_addresses = \[\(.*\)\]|listen_addresses = [\1, '127.0.0.2:53']|" "$t"
+    changed=1
+  fi
+  # резолвер малины → её dnscrypt (NetworkManager пишет resolv.conf)
+  if ! grep -q "servers=127.0.0.2" /etc/NetworkManager/conf.d/00-gate-dns.conf 2>/dev/null; then
+    printf '# Резолвер САМОЙ малины = её dnscrypt (шифрованный, выходит той же полосой).\n[global-dns-domain-*]\nservers=127.0.0.2\n' \
+      | sudo tee /etc/NetworkManager/conf.d/00-gate-dns.conf >/dev/null
+    sudo systemctl reload-or-restart NetworkManager >/dev/null 2>&1 || true
+    printf 'nameserver 127.0.0.2\n' | sudo tee /etc/resolv.conf >/dev/null
+  fi
+  if [ ! -f "$d" ]; then
+    sudo install -d /etc/systemd/system/dnscrypt-proxy.service.d
+    printf '[Service]\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n' \
+      | sudo tee "$d" >/dev/null
+    sudo systemctl daemon-reload
+    changed=1
+  fi
+  sudo sysctl -qw net.ipv4.ip_nonlocal_bind=1 2>/dev/null || true
+  grep -qs ip_nonlocal_bind /etc/sysctl.d/99-gate-tproxy.conf 2>/dev/null || \
+    echo "net.ipv4.ip_nonlocal_bind=1" | sudo tee -a /etc/sysctl.d/99-gate-tproxy.conf >/dev/null
+  [ "$changed" = 1 ] && sudo systemctl restart dnscrypt-proxy 2>/dev/null
+  return 0
+}
+
+# Собственный трафик малины (а значит и её dnscrypt) отправляем в канал ПРЯМОГО C2.
+# Иначе он идёт основной идентичностью → глобальным выходом: при global=ovpn резолвер
+# видел бы американский IP туннеля, и DNS полосы C2 палил бы связь с VPN.
+# Запись помечаем mac=self — она только для роутинга, в DHCP не попадает.
+lanes_self_route(){
+  local ch ip
+  ch="$(lane_rows | awk '$4=="c2" && $1!="self" {print $3; exit}')"
+  sudo sed -i '/^self[[:space:]]/d' "$CLIENT_LANES" 2>/dev/null
+  [ -n "$ch" ] || return 0
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  [ -n "$ip" ] || return 0
+  echo "self $ip $ch c2 (малина)" | sudo tee -a "$CLIENT_LANES" >/dev/null
 }
 GLOBAL_EXIT="/etc/gate/global-exit.conf"       # GLOBAL=c2|ovpn|pptp|socks  GLOBAL_SOCKS=<профиль>
 
@@ -749,6 +814,7 @@ lanes_dhcp_write(){
     local mac ip ch tgt name dns
     while read -r mac ip ch tgt name; do
       [ -n "$mac" ] || continue
+      [ "$mac" = self ] && continue    # служебная запись роутинга, не устройство
       dns="$(lane_dns_for "$tgt")"
       echo "dhcp-host=$mac,$ip,set:lane$ch"
       [ -n "$dns" ] && echo "dhcp-option=tag:lane$ch,option:dns-server,$dns"
@@ -790,7 +856,7 @@ cmd_client(){
     echo "$mac $ip $ch $val ${name:-—}" | sudo tee -a "$CLIENT_LANES" >/dev/null
     echo "→ ${YEL}${name:-$mac}${R} ($ip) → ${YEL}$(exit_label_spec "$val")${R} ${D}(канал $ch)${R}; адрес закреплён"
   fi
-  lanes_dhcp_write
+  dnscrypt_listen_ensure; lanes_self_route; lanes_dhcp_write
   sudo systemctl restart dnsmasq 2>/dev/null
   echo "→ Применяю на малине…"
   render_pi_apply || return 1
@@ -906,7 +972,8 @@ PYEOF
     apply)
       lanes_enabled || { echo "  ${RED}✗ каналы не созданы${R} — ${YEL}gate lanes init${R}"; return 1; }
       echo "→ Применяю раскладку каналов на малине…"
-      lanes_dhcp_write; sudo systemctl restart dnsmasq 2>/dev/null
+      dnscrypt_listen_ensure; lanes_self_route; lanes_dhcp_write
+      sudo systemctl restart dnsmasq 2>/dev/null
       render_pi_apply || return 1
       tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
       echo "→ Применяю конфиг выхода на C2…"

@@ -46,7 +46,18 @@ HOP_IPS="$(python3 -c "import json;print(' '.join(h['host'] for h in json.load(o
 # может быть НЕСКОЛЬКО резолверов (по одному в строке) — заворачиваем каждый
 VPN_DNS="$(cat /etc/gate/vpn-dns 2>/dev/null | tr '\n' ' ' || true)"
 # IP клиентов с персональным выходом (<MAC> <IP> <канал> <выход> [имя]) — их DNS идёт в полосу
-LANE_CLIENTS="$(awk '!/^#/ && NF>=4 {print $2}' /etc/gate/client-lanes.conf 2>/dev/null | tr '\n' ' ')"
+LANE_CLIENTS="$(awk '!/^#/ && $1!="self" && NF>=4 {print $2}' /etc/gate/client-lanes.conf 2>/dev/null | tr '\n' ' ')"
+# Адрес dnscrypt для клиентов полосы прямого C2 — на ОТДЕЛЬНОМ dummy-интерфейсе.
+# Ни AP-интерфейс, ни lo не подходят: dnsmasq поднят с bind-interfaces и занимает порт 53
+# на всех адресах своих интерфейсов И на loopback — тогда dnscrypt с ним дерётся и один
+# из них не стартует. Свой dummy dnsmasq не трогает. Клиент шлёт на 10.53.0.1 → пакет идёт
+# на шлюз (малину) → адрес локальный → дойдёт до dnscrypt. Приватные адреса tproxy не трогает.
+AP_DNS_ADDR="${AP_DNS_ADDR:-10.53.0.1}"
+AP_DNS_IF="${AP_DNS_IF:-gatedns0}"
+ip link show "$AP_DNS_IF" >/dev/null 2>&1 || ip link add "$AP_DNS_IF" type dummy 2>/dev/null || true
+ip link set "$AP_DNS_IF" up 2>/dev/null || true
+ip -4 addr show dev "$AP_DNS_IF" 2>/dev/null | grep -q "$AP_DNS_ADDR/" || \
+  ip addr add "$AP_DNS_ADDR/32" dev "$AP_DNS_IF" 2>/dev/null || true
 
 # приватные/служебные сети, которые НЕ заворачиваем (клиенты и сама малина)
 PRIV="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
