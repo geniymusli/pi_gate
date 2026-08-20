@@ -786,6 +786,7 @@ cmd_global(){
       echo "→ Глобальный выход → прямой C2…"
       local cur; cur="$(global_get)"
       sudo bash -c "printf 'GLOBAL=c2\nGLOBAL_SOCKS=\n' > $GLOBAL_EXIT"
+      echo off | sudo tee "$SOCKS_STATE" >/dev/null
       case "$cur" in
         ovpn|pptp)
           # туннель гасим, ТОЛЬКО если его не ждёт какой-нибудь канал (устройство на exit vpn)
@@ -1454,7 +1455,16 @@ cmd_osfp(){
 # ── Общая логика exit-режимов (socks / ovpn / pptp / direct) ──────────
 exit_label(){ case "$1" in socks) echo "носок (SOCKS5)";; ovpn) echo "OpenVPN";; pptp) echo "PPTP";; *) echo "прямой (C2)";; esac; }
 
-active_exit(){  # текущий активный режим выхода
+active_exit(){  # ГЛОБАЛЬНЫЙ режим выхода (то, что получают неназначенные клиенты)
+  # Источник правды — global-exit.conf (пишет `gate global`). Раньше читались флаги
+  # socks.state/vpn.state, и залипший socks.state=on показывал «носок», когда реально
+  # работал VPN. Флаги оставлены как фоллбэк для конфигов, где global-exit.conf ещё нет.
+  local g; g="$(global_get)"
+  case "$g" in
+    ovpn|pptp) echo "$g"; return ;;
+    socks)     echo socks; return ;;
+    c2)        echo direct; return ;;
+  esac
   [ "$(cat "$SOCKS_STATE" 2>/dev/null)" = on ] && { echo socks; return; }
   if [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ]; then . "$VPN_META" 2>/dev/null; echo "${TYPE:-ovpn}"; return; fi
   echo direct
@@ -1851,6 +1861,9 @@ gate-vpn up"; then
   echo on | sudo tee "$VPN_STATE" >/dev/null
   echo "TYPE=$t" | sudo tee "$VPN_META" >/dev/null
   sudo bash -c "printf 'GLOBAL=%s\nGLOBAL_SOCKS=\n' '$t' > $GLOBAL_EXIT"
+  # носок больше не глобальный выход → снимаем его флаг, иначе статус и exit_apply
+  # видят два «включённых» выхода сразу (каналы socks:<профиль> от этого не зависят)
+  echo off | sudo tee "$SOCKS_STATE" >/dev/null
   if ! exit_apply; then
     echo "  ${RED}✗ конфиг выхода на C2 не применился${R} — снимаю туннель, возврат на прямой C2"
     sudo bash -c "printf 'GLOBAL=c2\nGLOBAL_SOCKS=\n' > $GLOBAL_EXIT"

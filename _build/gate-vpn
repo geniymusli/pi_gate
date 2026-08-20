@@ -87,7 +87,7 @@ up(){
         exit 1
       fi
       # up-хук: собрать push'нутые сервером dhcp-option DNS в общий накопитель (как usepeerdns
-      # у pptp). С route-nopull опции всё равно приходят в foreign_option_* окружения скрипта.
+      # у pptp). Опции приходят в foreign_option_* окружения скрипта (см. про route-nopull ниже).
       cat > "$DIR/ovpn-up.sh" <<'UP'
 #!/bin/sh
 out=/etc/gate/vpn/pushed-dns; mkdir -p /etc/gate/vpn
@@ -99,16 +99,21 @@ done
 sort -u "$out" -o "$out" 2>/dev/null || true
 UP
       chmod 755 "$DIR/ovpn-up.sh"
-      # route-nopull + route-noexec: openvpn НЕ ставит НИ одного маршрута (ни пушнутых сервером,
-      # ни ЛОКАЛЬНЫХ из конфига). КРИТИЧНО: в чужих .ovpn часто есть `redirect-gateway def1` —
-      # один route-nopull его НЕ давит (он локальный, не пушнутый), и openvpn увёл бы default
-      # route C2 в туннель → C2 теряет связь со всем (включая управление с C1). route-noexec
-      # это исключает: main-таблицу не трогаем вообще, дефолт в таблицу VPN ставит wait_iface.
-      # Побочно делает безопасным прерывание `on` на полпути (main-роутинг C2 не меняется).
+      # route-noexec: openvpn НЕ ставит НИ одного маршрута — ни пушнутых сервером, ни
+      # ЛОКАЛЬНЫХ из конфига. КРИТИЧНО: в чужих .ovpn часто есть `redirect-gateway def1`,
+      # и без этого openvpn увёл бы default route C2 в туннель → C2 теряет связь со всем
+      # (включая управление с C1). Здесь main-таблицу не трогаем вообще, а дефолт в таблицу
+      # VPN ставит wait_iface. Побочно: прерывание `on` на полпути безопасно.
+      #
+      # route-nopull НЕ используем СОЗНАТЕЛЬНО: он глушит не только маршруты, но и pushed
+      # DNS (`dhcp-option DNS`) — openvpn отвергал их с «option dhcp-option cannot be used
+      # in this context ([PUSH-OPTIONS])», накопитель pushed-dns оставался пустым, и клиенты
+      # сидели на dnscrypt малины (anycast-резолвер → страна DNS не совпадала с выходом).
+      # Маршруты и так не применяются из-за route-noexec, так что терять нечего.
       # script-security 2 нужен, иначе up-хук не запустится и DNS не снимется.
       # auth-retry nointeract: НИКОГДА не спрашивать креды интерактивно (демон, tty нет) —
       # при нехватке/неверных кредах openvpn падает с ошибкой в лог, а не виснет навсегда.
-      openvpn --config "$DIR/client.ovpn" $auth --route-nopull --route-noexec \
+      openvpn --config "$DIR/client.ovpn" $auth --route-noexec \
         --auth-retry nointeract \
         --up "$DIR/ovpn-up.sh" --script-security 2 --log-append "$LOG" --daemon
       sleep 3
