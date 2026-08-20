@@ -1872,12 +1872,17 @@ gate-vpn up"; then
   fi
   # Клиентский DNS в VPN-режиме → тоннельный шлюз (1-й pushed-DNS) через цепочку, чтобы у
   # КЛИЕНТОВ резолвер был резидентным (как у выхода), а не dnscrypt малины (Quad9/CF).
-  local gw; gw="$(s2_exec "head -1 $C2_VPN_DIR/pushed-dns 2>/dev/null" | tr -d '\r' | awk '{print $1}')"
-  if [ -n "$gw" ]; then
-    echo "$gw" | sudo tee /etc/gate/vpn-dns >/dev/null
-    sudo sed -i "s|^server=.*|server=$gw|" /etc/dnsmasq.d/gate.conf
+  # Берём ВСЕ пушнутые резолверы, а не первый: одиночный сервер через цепочку+туннель
+  # даёт заметные потери UDP (в проде было retried 225 / failed 183 из 936), а на отвал
+  # сетевого DNS телефоны отвечают уходом в СВОЙ шифрованный DNS — и страна DNS уезжает.
+  local gws; gws="$(s2_exec "cat $C2_VPN_DIR/pushed-dns 2>/dev/null" | tr -d '\r' | awk 'NF{print $1}')"
+  if [ -n "$gws" ]; then
+    printf '%s\n' "$gws" | sudo tee /etc/gate/vpn-dns >/dev/null
+    # все server= строки заменяем на пушнутые (по одной на резолвер)
+    sudo sed -i '/^server=/d' /etc/dnsmasq.d/gate.conf
+    printf 'server=%s\n' $gws | sudo tee -a /etc/dnsmasq.d/gate.conf >/dev/null
     sudo systemctl restart dnsmasq 2>/dev/null
-    echo "→ Клиентский DNS → тоннельный резолвер $gw (резидентный, как выход)"
+    echo "→ Клиентский DNS → тоннельные резолверы: $(printf '%s ' $gws)(резидентные, как выход)"
   else
     sudo rm -f /etc/gate/vpn-dns
     echo "  ${YEL}⚠ pushed-DNS пуст — клиентский DNS остаётся на dnscrypt малины${R}"

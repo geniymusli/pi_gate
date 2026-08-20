@@ -43,7 +43,8 @@ HOP_IPS="$(python3 -c "import json;print(' '.join(h['host'] for h in json.load(o
 
 # IP тоннельного DNS-шлюза (VPN-режим, пишет vpn_on): его НЕ исключаем как приватный, а
 # ЗАВОРАЧИВАЕМ в tproxy → цепочка → C2 → ppp0 → форвардер ISP. Так клиентский DNS резидентный.
-VPN_DNS="$(cat /etc/gate/vpn-dns 2>/dev/null || true)"
+# может быть НЕСКОЛЬКО резолверов (по одному в строке) — заворачиваем каждый
+VPN_DNS="$(cat /etc/gate/vpn-dns 2>/dev/null | tr '\n' ' ' || true)"
 
 # приватные/служебные сети, которые НЕ заворачиваем (клиенты и сама малина)
 PRIV="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
@@ -88,10 +89,10 @@ iptables -t mangle -C PREROUTING -j GATE_TP 2>/dev/null || iptables -t mangle -A
 # исключения (мимо tproxy): все хопы цепочки напрямую, приватные/служебные сети
 for ip in $HOP_IPS; do iptables -t mangle -A GATE_TP -d "$ip" -j RETURN; done
 # VPN-DNS шлюз — заворачиваем в tproxy ДО исключения приватных (иначе уйдёт в RETURN и умрёт)
-if [ -n "$VPN_DNS" ]; then
-  iptables -t mangle -A GATE_TP -d "$VPN_DNS" -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
-  iptables -t mangle -A GATE_TP -d "$VPN_DNS" -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
-fi
+for d in $VPN_DNS; do
+  iptables -t mangle -A GATE_TP -d "$d" -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
+  iptables -t mangle -A GATE_TP -d "$d" -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$MARK_TP"
+done
 for n in $PRIV; do iptables -t mangle -A GATE_TP -d "$n" -j RETURN; done
 # Force-DNS: клиентский :53 не отдаём в tproxy — его перехватит nat DNAT (ниже)
 iptables -t mangle -A GATE_TP -i "$AP_IF" -p udp --dport 53 -j RETURN
@@ -109,7 +110,7 @@ iptables -t mangle -C OUTPUT -j GATE_TP_LOCAL 2>/dev/null || iptables -t mangle 
 iptables -t mangle -A GATE_TP_LOCAL -m mark --mark "$MARK_OUT" -j RETURN
 for ip in $HOP_IPS; do iptables -t mangle -A GATE_TP_LOCAL -d "$ip" -j RETURN; done
 # VPN-DNS шлюз (см. VPN_DNS выше) — МЕТИМ для туннеля ДО PRIV-RETURN ниже (шлюз приватный 10.0.0.x)
-[ -n "$VPN_DNS" ] && iptables -t mangle -A GATE_TP_LOCAL -d "$VPN_DNS" -j MARK --set-mark "$MARK_TP"
+for d in $VPN_DNS; do iptables -t mangle -A GATE_TP_LOCAL -d "$d" -j MARK --set-mark "$MARK_TP"; done
 for n in $PRIV; do iptables -t mangle -A GATE_TP_LOCAL -d "$n" -j RETURN; done
 iptables -t mangle -A GATE_TP_LOCAL -p tcp -j MARK --set-mark "$MARK_TP"
 iptables -t mangle -A GATE_TP_LOCAL -p udp -j MARK --set-mark "$MARK_TP"

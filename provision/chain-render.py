@@ -121,23 +121,16 @@ VPN_DNS_FILE = "/etc/gate/vpn-dns"      # IP тоннельного DNS-шлюз
 
 
 def _vpn_dns():
-    """IP DNS-шлюза туннеля (первый pushed-DNS) в VPN-режиме, иначе None. Клиентский DNS
-    малина форвардит на него → резолвер у клиентов резидентный (как у выхода), не dnscrypt."""
+    """Резолверы туннеля (все pushed-DNS, по одному в строке) — список, иначе пусто.
+    Клиентский DNS малина форвардит на них → резолвер у клиентов резидентный (как у
+    выхода), а не dnscrypt. Их адреса надо завернуть В ЦЕПОЧКУ, иначе не доедут."""
     try:
-        v = open(VPN_DNS_FILE).read().strip()
-        return v or None
+        return [x.strip() for x in open(VPN_DNS_FILE) if x.strip()]
     except OSError:
-        return None
+        return []
 
 
-# ─── Полосы (lanes): у клиента может быть СВОЙ выход ──────────────────────────
-# Механика: у inbound каждого хопа ДВЕ VLESS-идентичности с разными email —
-#   lane-main (uuid)   — обычная полоса, выход = прямой C2;
-#   lane-vpn  (uuid_b) — полоса «в туннель», выход = tun0/ppp0 на C2.
-# Малина выбирает полосу по IP КЛИЕНТА (routing.source) → коннектится к C1 нужным uuid.
-# Реле роутит по `user` (email авторизовавшегося клиента, xray UserMatcher) в соответствующий
-# outbound к C2. Выход так же по `user` шлёт либо в direct, либо в vpn-out.
-# Так признак полосы доживает от малины до C2 БЕЗ новых портов и без новых reality-ключей.
+# ─── Каналы: у клиента может быть СВОЙ выход ──────────────────────────────────
 LANE_MAIN = "lane-main"
 CLIENT_LANES = "/etc/gate/client-lanes.conf"   # <MAC> <IP> <канал> <выход> [имя] (пишет `gate client`)
 
@@ -301,7 +294,7 @@ def render_pi(c):
     if vpn_dns:
         # тоннельный DNS-шлюз (часто приватный, напр. 10.0.0.10) — в цепочку ДО private-block,
         # иначе зарежется как приватный. На C2 он уже роутится в vpn-out → ppp0 → форвардер ISP.
-        rules.append({"type": "field", "ip": [vpn_dns], "outboundTag": "reality-s1"})
+        rules.append({"type": "field", "ip": vpn_dns, "outboundTag": "reality-s1"})
     rules.append({"type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "blocked"})
     if not quic_through:
         rules.append({"type": "field", "network": "udp", "port": 443, "outboundTag": "blocked"})
