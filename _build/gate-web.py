@@ -602,6 +602,8 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
 .muted{color:#6b7785;font-size:12px}
 #out{min-height:34px}
 .spin{opacity:.5}
+button:disabled,select:disabled,input:disabled{opacity:.45;cursor:not-allowed}
+body.busy{cursor:progress}
 </style></head><body>
 <header><h1>🛰 gate — панель</h1><a class=logout href=# onclick="logout()">выйти</a></header>
 
@@ -716,7 +718,7 @@ select,input{padding:7px 9px;border-radius:8px;border:1px solid #2c3440;backgrou
   </div>
 </div>
 
-<div class=card>
+<div class=card id=outcard>
   <h2>Вывод последней команды</h2>
   <pre id=out>—</pre>
 </div>
@@ -798,24 +800,30 @@ function promoteSocks(){var n=(document.getElementById('promoName').value||'').t
   if(!n){setOut('укажи имя профиля');return}
   act('socks_promote',{name:n});document.getElementById('promoName').value=''}
 async function setName(mac,name){
-  setOut('… подпись',true);
-  var d=await api('/api/action',{method:'POST',body:JSON.stringify({action:'client_name',mac:mac,name:name})});
-  if(!d)return; if(d.error){setOut('ошибка: '+d.error);return}
-  setOut(d.out||('код '+d.code));loadDevs()}
+  var d=await run({action:'client_name',mac:mac,name:name},'сохраняю подпись');
+  if(d)loadDevs()}
 async function setDev(mac,target){
-  setOut('… назначаю выход',true);
-  var d=await api('/api/action',{method:'POST',
-    body:JSON.stringify({action:'client_exit',mac:mac,target:target||'auto'})});
-  if(!d)return;
-  if(d.error){setOut('ошибка: '+d.error);return}
-  setOut(d.out||('код '+d.code));refresh()}
+  var d=await run({action:'client_exit',mac:mac,target:target||'auto'},'назначаю выход');
+  if(d)refresh()}
 async function refresh(){loadInfo();loadState();loadProfiles();loadDevs()}
-async function act(action,extra){setOut('… '+action,true);
-  var body=Object.assign({action:action},extra||{});
-  var d=await api('/api/action',{method:'POST',body:JSON.stringify(body)});
-  if(!d)return;
-  if(d.error){setOut('ошибка: '+d.error);return}
-  setOut(d.out||('код '+d.code));refresh()}
+// Пока команда идёт (а `doctor`/`socks test` лезут на C2 через цепочку и это небыстро),
+// блокируем управление и подводим к выводу — иначе кажется, что кнопка не сработала.
+function uiBusy(on){
+  document.querySelectorAll('button,select,input').forEach(function(e){e.disabled=on});
+  document.body.classList.toggle('busy',on)}
+function showOut(){var c=document.getElementById('outcard');
+  if(c&&c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'center'})}
+async function run(body,label){
+  setOut('… '+label+' — идёт, дождись ответа',true);uiBusy(true);showOut();
+  var d=null;
+  try{d=await api('/api/action',{method:'POST',body:JSON.stringify(body)})}
+  finally{uiBusy(false)}
+  if(!d)return null;
+  if(d.error){setOut('ошибка: '+d.error);return null}
+  setOut(d.out||('код '+d.code));return d}
+async function act(action,extra){
+  var d=await run(Object.assign({action:action},extra||{}),action);
+  if(d)refresh()}
 async function loadProfiles(){var d=await api('/api/profiles');if(!d)return;
   var box=document.getElementById('profiles');box.innerHTML='';
   var any=false;
@@ -840,7 +848,7 @@ function savePptp(){var b={name:gv('qn'),server:gv('qs'),user:gv('qu'),pass:gv('
   ['qn','qs','qu','qpw'].forEach(function(id){document.getElementById(id).value=''})}
 function doWipe(){if(confirm('ОЧИСТКА: удалить ВСЕ профили, стейт и креды на C2? Необратимо.'))act('wipe')}
 async function logout(){await fetch('/logout',{method:'POST'});location.reload()}
-refresh();setInterval(function(){loadInfo();loadState();loadDevs()},20000);
+refresh();setInterval(function(){if(!document.body.classList.contains('busy')){loadInfo();loadState();loadDevs()}},20000);
 </script></body></html>"""
 
 
