@@ -14,14 +14,44 @@
 #
 set -uo pipefail
 
-MGMT_KEY="${MGMT_KEY:-$HOME/.ssh/gate_to_s1}"
 CHAIN_JSON="${CHAIN_JSON:-/etc/gate/chain.json}"
 RENDER="${RENDER:-/usr/local/bin/chain-render.py}"
 BOOTSTRAP="${BOOTSTRAP:-/usr/local/share/gate/vps-bootstrap.sh}"
+
+# ── ключ малины (Pi→C1) ────────────────────────────────────────────────
+# ИСТОЧНИК ПРАВДЫ — chain.json: там лежит АБСОЛЮТНЫЙ путь (`mgmt_key`). Брать его из
+# $HOME нельзя: под `sudo` $HOME=/root, ключ ищется в /root/.ssh/gate_to_s1, его там нет,
+# и хоп 0 молча НЕ разливается («Identity file … not accessible» → Permission denied).
+# Цепочка при этом рвётся тихо: C1 остаётся смотреть на СТАРЫЙ выход. Наступали 2026-09-02.
+# $HOME (точнее — дом ЗАПУСТИВШЕГО, а не root) нужен только для ПЕРВИЧНОГО setup,
+# когда chain.json ещё нет.
+user_home(){
+  if [ -n "${SUDO_USER:-}" ]; then getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6
+  else printf '%s' "$HOME"; fi
+}
+mgmt_key_from_chain(){
+  [ -f "$CHAIN_JSON" ] || return 1
+  sudo cat "$CHAIN_JSON" 2>/dev/null | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin).get('mgmt_key','') or '')
+except Exception: pass" 2>/dev/null | grep -E '^/.'
+}
+if [ -z "${MGMT_KEY:-}" ]; then
+  MGMT_KEY="$(mgmt_key_from_chain || true)"
+  [ -n "$MGMT_KEY" ] || MGMT_KEY="$(user_home)/.ssh/gate_to_s1"
+fi
+
 # Пиннованный amd64-бинарь xray для серверов — стейджится на хоп ПЕРЕД bootstrap'ом,
 # чтобы сервер (в т.ч. в РФ, без GitHub) ставил xray из него, а не тянул из инета.
 XRAY_BIN="${XRAY_BIN:-/usr/local/share/gate/xray-linux-amd64}"
 XRAY_BIN_REMOTE="/tmp/gate-xray.bin"
+# geoip.dat/geosite.dat — официальный установщик xray качает их сам, а мы его обходим,
+# поэтому стейджим рядом с бинарём. Без них падает ЛЮБОЙ конфиг с `geoip:*`/`geosite:*`
+# (у нас — `geoip:private` в конфиге выхода): xray -test → «bad config», exit_apply
+# отваливается, и полосы тихо не применяются. Наступали 2026-09-02.
+XRAY_DAT_DIR="${XRAY_DAT_DIR:-/usr/local/share/xray}"
+GEOIP_REMOTE="/tmp/gate-geoip.dat"
+GEOSITE_REMOTE="/tmp/gate-geosite.dat"
 PI_XRAY_CONF="/usr/local/etc/xray/config.json"
 SSH_USER="${SSH_USER:-root}"
 SSH_PORT="${SSH_PORT:-22}"
@@ -142,13 +172,29 @@ stage_xray_bin(){
   gzip -c "$XRAY_BIN" | base64 -w0 \
     | on_hop "$i" "base64 -d | gunzip > $XRAY_BIN_REMOTE && chmod 644 $XRAY_BIN_REMOTE && echo '    ✓ xray доставлен'" \
     || warn "не доставил бинарь xray — bootstrap уйдёт в GitHub-фоллбэк"
+  stage_xray_dat "$i"
+}
+
+# ── доставить geoip.dat/geosite.dat на хоп i (gzip+base64, как бинарь) ──
+# Обязательны: конфиг выхода содержит `geoip:private`, и без файла xray -test валит его
+# целиком. Симптом коварный — сам выход работает, а полосы молча не применяются.
+stage_xray_dat(){
+  local i="$1" f src dst
+  for f in "geoip.dat:$GEOIP_REMOTE" "geosite.dat:$GEOSITE_REMOTE"; do
+    src="$XRAY_DAT_DIR/${f%%:*}"; dst="${f##*:}"
+    [ -f "$src" ] || { warn "нет $src на малине — на хопе не будет ${f%%:*} (конфиги с geoip:* не пройдут)"; continue; }
+    say "  • доставляю ${f%%:*} ($(du -h "$src" | cut -f1))…"
+    gzip -c "$src" | base64 -w0 \
+      | on_hop "$i" "base64 -d | gunzip > $dst && chmod 644 $dst && echo '    ✓ ${f%%:*} доставлен'" \
+      || warn "не доставил ${f%%:*}"
+  done
 }
 
 # ── bootstrap хопа i (xray/BBR/ufw/ssh) — пайпом, доступом по роли ──────
 bootstrap_hop(){
   stage_xray_bin "$1"
   say "  • bootstrap (xray/BBR/ufw/ssh)…"
-  on_hop "$1" "XRAY_BIN=$XRAY_BIN_REMOTE bash -s" < "$BOOTSTRAP" | sed 's/^/    /' || die "bootstrap упал"
+  on_hop "$1" "XRAY_BIN=$XRAY_BIN_REMOTE GEOIP_DAT=$GEOIP_REMOTE GEOSITE_DAT=$GEOSITE_REMOTE bash -s" < "$BOOTSTRAP" | sed 's/^/    /' || die "bootstrap упал"
 }
 
 # ── деплой конфига на хоп i (рендер + cat>файл + xray -test + рестарт) ──

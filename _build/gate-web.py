@@ -737,7 +737,13 @@ function mark(id,on){var e=document.getElementById(id);if(e)e.classList.toggle('
 function gsockVal(){var e=document.getElementById('gsock');return e?e.value:''}
 async function loadState(){var s=await api('/api/state');if(!s)return;
   var names={socks:'носок'+(s.global_socks?' «'+s.global_socks+'»':''),ovpn:'OpenVPN',pptp:'PPTP',direct:'прямой C2'};
-  document.getElementById('curmode').textContent=names[s.exit]||s.exit;
+  // Тут показан ГЛОБАЛЬНЫЙ выход (для неназначенных). Туннель может быть поднят ради
+  // ПОЛОСЫ, даже когда глобальный — прямой C2: без этой приписки выглядело так, будто
+  // VPN выключен, хотя устройство через него ходит.
+  var m=names[s.exit]||s.exit;
+  if(s.exit!=='ovpn'&&s.exit!=='pptp'&&s.vpn==='on')
+    m+=' · '+(s.vtype==='pptp'?'PPTP':'VPN')+'-туннель поднят для полосы';
+  document.getElementById('curmode').textContent=m;
   mark('so_on',s.exit==='socks');
   mark('ov_on',s.exit==='ovpn');
   mark('pp_on',s.exit==='pptp');

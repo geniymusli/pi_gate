@@ -112,6 +112,23 @@ fi
 mkdir -p /usr/local/etc/xray /var/log/xray
 chown nobody /var/log/xray 2>/dev/null || true   # юнит работает под nobody
 
+# geoip.dat/geosite.dat. Офиц. установщик кладёт их сам, а при ОФЛАЙН-установке из голого
+# бинаря их нет — и тогда ЛЮБОЙ конфиг с `geoip:*`/`geosite:*` не проходит `xray -test`.
+# У нас это конфиг выхода (`geoip:private`): выход продолжает работать на старом конфиге,
+# а новые полосы молча не применяются («⚠ конфиг выхода не применился»). Наступали 2026-09-02.
+mkdir -p /usr/local/share/xray
+for _p in "geoip.dat:${GEOIP_DAT:-/tmp/gate-geoip.dat}" "geosite.dat:${GEOSITE_DAT:-/tmp/gate-geosite.dat}"; do
+  _name="${_p%%:*}"; _src="${_p##*:}"
+  if [ -s "/usr/local/share/xray/$_name" ]; then
+    log "$_name уже на месте"
+  elif [ -s "$_src" ]; then
+    install -m 644 "$_src" "/usr/local/share/xray/$_name"; rm -f "$_src"
+    log "$_name поставлен ($(du -h "/usr/local/share/xray/$_name" | cut -f1))"
+  else
+    warn "нет $_name (не передан и не установлен) — конфиги с geoip:*/geosite:* работать НЕ будут"
+  fi
+done
+
 # плейсхолдер-конфиг (валидный, ничего не делает) — чтобы сервис мог стартовать,
 # пока визард не зальёт настоящий. Не трогаем, если конфиг уже непустой/настоящий.
 if ! grep -q reality /usr/local/etc/xray/config.json 2>/dev/null; then

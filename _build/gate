@@ -799,6 +799,11 @@ exit_spec_ok(){ case "${1:-}" in
         echo "  ${RED}✗ нет профиля носка «$n»${R}"
         echo "     ${D}создать:${R} gate profile save socks $n <ip> <port> [user] [pass]"
         echo "     ${D}список:${R}  gate profile list socks"; return 1; }
+      # Возможности не проверены → exit_apply по fail-closed зарежет полосе UDP, у клиента
+      # умрёт DNS и «интернета нет вообще». Раньше это происходило МОЛЧА.
+      sudo test -f "$PROFILE_DIR/socks/$n.caps" || {
+        echo "  ${YEL}⚠ возможности носка «$n» не проверены${R} — полосе будет зарезан UDP (умрёт DNS)"
+        echo "     ${D}проверь:${R} gate profile use socks $n && gate socks test"; }
       return 0 ;;
     *) echo "Куда: ${GRN}c2${R} · ${YEL}vpn${R} · ${YEL}socks:<профиль>${R}"; return 1 ;;
   esac; }
@@ -1299,7 +1304,9 @@ chown pi:pi $SOCKS_CAPS"
 cmd_socks(){
   case "${1:-status}" in
     test)
+      local inline=0
       if [ -n "${2:-}" ]; then
+        inline=1
         SOCKS_IP="$2"; SOCKS_PORT="${3:-}"; SOCKS_USER="${4:-}"; SOCKS_PASS="${5:-}"
       else
         [ -f "$SOCKS_CONF" ] || { echo "Нет носка. Укажи: gate socks test <ip> <port> [user] [pass]"; exit 1; }
@@ -1320,6 +1327,20 @@ cmd_socks(){
       if [ -n "$eip" ]; then
         local geo; geo=$(s2_exec "curl -s --max-time 10 http://ip-api.com/line/$eip?fields=country,regionName,city,isp 2>/dev/null")
         [ -n "$geo" ] && printf "  гео:        %s\n" "$(echo "$geo" | tr '\n' ' ')"
+      fi
+      # СОХРАНЯЕМ возможности, а не только печатаем. Раньше их писал ТОЛЬКО `socks on`,
+      # поэтому носок, живущий лишь как ПОЛОСА (gate client … exit socks:<профиль>), навсегда
+      # оставался «неподтверждённым»: exit_apply по fail-closed резал ему UDP → у клиента
+      # умирал DNS и интернета не было вовсе. Наступали 2026-09-02.
+      # Носок задан инлайном — чужой, состояние сохранённого не трогаем.
+      if [ "$inline" = 0 ]; then
+        socks_caps_set "$caps"
+        # если этот носок уже вынесен в профили — обновляем и их возможности
+        local pf
+        for pf in "$PROFILE_DIR"/socks/*.conf; do
+          [ -f "$pf" ] || continue
+          sudo cmp -s "$pf" "$SOCKS_CONF" && printf '%s\n' "$caps" | sudo tee "${pf%.conf}.caps" >/dev/null
+        done
       fi
       ;;
     set)
@@ -1350,7 +1371,14 @@ EOF"
       sudo test -f "$SOCKS_CONF" || { echo "Нет текущего носка — сначала: ${YEL}gate socks set <ip> <port> [user] [pass]${R}"; exit 1; }
       sudo mkdir -p "$PROFILE_DIR/socks"
       sudo install -m600 "$SOCKS_CONF" "$PROFILE_DIR/socks/$n.conf"
-      [ -f "$SOCKS_CAPS" ] && sudo install -m600 "$SOCKS_CAPS" "$PROFILE_DIR/socks/$n.caps"
+      if [ -f "$SOCKS_CAPS" ]; then
+        sudo install -m600 "$SOCKS_CAPS" "$PROFILE_DIR/socks/$n.caps"
+      else
+        # Без caps exit_apply пойдёт по fail-closed и ЗАРЕЖЕТ UDP полосе (у клиента умрёт
+        # DNS). Молчать нельзя — раньше именно это выглядело как «интернета нет вообще».
+        echo "  ${YEL}⚠ возможности носка не проверены${R} — у полосы будет зарезан UDP (умрёт DNS)"
+        echo "     ${D}проверь и сохрани их:${R} gate socks test"
+      fi
       echo "Текущий носок сохранён как профиль ${B}$n${R}"
       echo "  ${D}повесить на устройство:${R} gate client <ip|mac|имя> exit socks:$n"
       echo "  ${D}сделать основным:${R}      gate global socks on $n"
@@ -1986,10 +2014,20 @@ def resolve(spec, who):
     notes.append("%s: неизвестный выход «%s»" % (who, spec))
     return "blocked", False
 
-# ── DNS туннеля (только когда глобальный выход — VPN) ──
+# ── DNS туннеля ──
+# ВАЖНО: раньше проверялось ТОЛЬКО gexit (глобальный режим). Но VPN сплошь и рядом активен
+# только как ПОЛОСА конкретного устройства (global=c2, канал-N=vpn, ноут рядом на прямом
+# C2) — при gexit=c2 условие было ложным, правило "pushed-DNS → vpn-out" не строилось
+# ВООБЩЕ. Итог: СОБСТВЕННЫЙ DNS-форвардинг малины (dnsmasq server=<pushed>, см. vpn_on())
+# уходит своей идентичностью (self → lane канала C2, НЕ канала vpn) → user:['lane-N'] →
+# direct → DNS "утекает" через хостинг САМОГО C2 (в РФ), хотя ДАННЫЕ полосы шли верно через
+# тоннель. Симптом у юзера: DNS показывал Google Finland через <хостер C2>.
+# Наступали 2026-09-03. Фикс: строить правило, если VPN нужен ЛЮБОМУ потребителю —
+# глобальному выходу ИЛИ хотя бы одному каналу.
 pushed = [x for x in os.environ.get("GATE_PUSHED_DNS", "").split() if x]
 fbl    = [x for x in os.environ.get("GATE_DNS_FALLBACK", "").split() if x]
-use    = (pushed if pushed else fbl) if (gexit in ("ovpn", "pptp") and vpn_on) else []
+vpn_used = vpn_on and (gexit in ("ovpn", "pptp") or any(v == "vpn" for v in chans.values()))
+use    = (pushed if pushed else fbl) if vpn_used else []
 if use:
     c["dns"] = {"servers": use, "queryStrategy": "UseIPv4"}
     ds = "IpOnDemand"
@@ -2076,12 +2114,21 @@ gate-vpn up"; then
     # все server= строки заменяем на пушнутые (по одной на резолвер)
     sudo sed -i '/^server=/d' /etc/dnsmasq.d/gate.conf
     printf 'server=%s\n' $gws | sudo tee -a /etc/dnsmasq.d/gate.conf >/dev/null
-    sudo systemctl restart dnsmasq 2>/dev/null
     echo "→ Клиентский DNS → тоннельные резолверы: $(printf '%s ' $gws)(резидентные, как выход)"
   else
     sudo rm -f /etc/gate/vpn-dns
     echo "  ${YEL}⚠ pushed-DNS пуст — клиентский DNS остаётся на dnscrypt малины${R}"
   fi
+  # ПЕРЕПИСАТЬ dhcp-option для полосы vpn: `lane_dns_for(vpn)` читает vpn-dns динамически,
+  # но САМА раскладка (/etc/dnsmasq.d/gate-lanes.conf) кэширована — обновляется только явным
+  # вызовом lanes_dhcp_write. Устройство почти всегда назначается на `vpn` ДО того, как
+  # туннель поднят (vpn-dns ещё не существует) → строка dns-server для его тега не пишется
+  # ВООБЩЕ → клиент остаётся на дефолтном DNS малины, который резолвит через ПРЯМОЙ C2, а
+  # не через туннель. Итог у пользователя: «интернета нет», хотя туннель и data-plane
+  # исправны — тот же класс бага, что с socks.caps.
+  # Наступали 2026-09-03.
+  lanes_dhcp_write
+  sudo systemctl restart dnsmasq 2>/dev/null
   echo "→ Подстраиваю малину (routeOnly, QUIC, клиентский DNS в туннель)…"
   render_pi_apply; tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
   echo "Проверка…"; sleep 2; exit_status
@@ -2107,6 +2154,9 @@ vpn_off(){
   # вернуть клиентский DNS на dnscrypt малины
   sudo rm -f /etc/gate/vpn-dns
   sudo sed -i "s|^server=.*|server=127.0.0.1#5300|" /etc/dnsmasq.d/gate.conf
+  # Симметрично vpn_on: без этого устройство, ещё назначенное на `vpn`, застревает со
+  # СТАРОЙ dns-server опцией на уже мёртвый туннельный резолвер (тот же класс бага).
+  lanes_dhcp_write
   sudo systemctl restart dnsmasq 2>/dev/null
   echo "→ Возвращаю малину (клиентский DNS → dnscrypt)…"
   render_pi_apply; tproxy_active && sudo bash "$TPROXY_UP" >/dev/null 2>&1
