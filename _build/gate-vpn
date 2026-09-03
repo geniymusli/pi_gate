@@ -88,8 +88,21 @@ up(){
       fi
       # up-хук: собрать push'нутые сервером dhcp-option DNS в общий накопитель (как usepeerdns
       # у pptp). Опции приходят в foreign_option_* окружения скрипта (см. про route-nopull ниже).
+      # ВТОРАЯ задача хука — КРИТИЧНАЯ, добавлена 2026-09-04: переприменить маршрут в table
+      # 200. wait_iface() ниже ставит его лишь ОДИН РАЗ, сразу после первого подъёма. Но
+      # openvpn САМ переподключается по --ping-restart (keepalive из чужого .ovpn) без нашего
+      # участия, и если сервер при этом пришлёт другие pulled options, openvpn пересоздаёт
+      # tun0 ЦЕЛИКОМ («need to close and reopen TUN/TAP device») — ядро при уничтожении
+      # старого интерфейса чистит ВСЕ маршруты на него, включая наш. table 200 остаётся
+      # только с blackhole-заглушкой → весь трафик полосы vpn молча дропается (fail-closed),
+      # хотя tun0 у нового инстанса снова живой. У юзера это выглядело как «опять не
+      # работает опенка», хотя туннель поднят. Этот хук вызывается openvpn'ом ПРИ КАЖДОМ
+      # (пере)открытии tun0 (в т.ч. на ping-restart) — самое надёжное место чинить маршрут.
+      # $1 = имя устройства (tun0), даёт сам openvpn. Литерал 200/1 — таблица/metric из
+      # $TABLE вокруг (heredoc в кавычках, переменные сюда не подставляются).
       cat > "$DIR/ovpn-up.sh" <<'UP'
 #!/bin/sh
+ip route replace default dev "$1" table 200 metric 1 2>/dev/null
 out=/etc/gate/vpn/pushed-dns; mkdir -p /etc/gate/vpn
 i=1
 while eval "opt=\${foreign_option_$i:-}"; [ -n "$opt" ]; do
