@@ -1114,7 +1114,93 @@ harden_dns(){
     changed=1
   fi
   [ "$changed" = 1 ] && sudo systemctl restart dnscrypt-proxy >/dev/null 2>&1
+  clock_unit_ensure
   return 0
+}
+
+# ─── Часы малины ──────────────────────────────────────────────────────
+# У Pi нет RTC: после долгого простоя fake-hwclock восстанавливает ПОСЛЕДНЕЕ сохранённое время.
+# Отстали часы сильнее, чем возраст свежего сертификата резолвера → dnscrypt (DoH) отвергает
+# его «not yet valid» → у малины нет DNS → NTP не резолвит пул → часы не исправятся НИКОГДА.
+# Замкнутый круг, при этом все службы «active» (наступали 2026-10-04: Pi лежал 2 суток).
+# Разрываем его временем из заголовка Date, взятым ЧЕРЕЗ ЦЕПОЧКУ: socks5h — имя резолвит выход,
+# свой DNS малине не нужен; плейн http — чтобы самим не упереться в ту же проверку сертификата.
+CLOCK_UNIT=/etc/systemd/system/gate-clock.service
+CLOCK_URL="http://www.google.com"
+
+clock_synced(){ [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; }
+self_dns_ok(){ timeout 6 getent hosts api.ipify.org >/dev/null 2>&1; }
+clock_from_chain(){
+  curl -sI --max-time 10 -x "socks5h://$SOCKS_TEST" "$CLOCK_URL" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1
+}
+
+# clock_sync [попыток] — выставить часы по цепочке, если NTP не синхронизирован. 0 = часы в порядке.
+clock_sync(){
+  local tries="${1:-1}" i d="" them now diff
+  clock_synced && return 0
+  for i in $(seq 1 "$tries"); do
+    d="$(clock_from_chain)"
+    [ -n "$d" ] && break
+    [ "$i" -lt "$tries" ] && sleep 5
+  done
+  [ -n "$d" ] || { echo "время через цепочку не получено (цепочка не поднята?)"; return 1; }
+  them="$(date -d "$d" +%s 2>/dev/null)" || return 1
+  now="$(date +%s)"; diff=$(( them - now )); diff=${diff#-}
+  if [ "$diff" -gt 30 ]; then
+    sudo date -s "@$them" >/dev/null || return 1
+    echo "часы отставали на ${diff}с → $(date '+%F %T')"
+    sudo systemctl restart systemd-timesyncd >/dev/null 2>&1
+    sudo systemctl restart dnscrypt-proxy >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# DNS самой малины: dnscrypt, стартовавший на буте раньше WAN («network is unreachable»), может
+# остаться «active», но мёртвым. Лечится перезапуском — после того как часы верны.
+self_dns_fix(){
+  self_dns_ok && return 0
+  sudo systemctl restart dnscrypt-proxy >/dev/null 2>&1
+  local i; for i in 1 2 3 4 5 6; do sleep 2; self_dns_ok && return 0; done
+  return 1
+}
+
+# Юнит: на каждой загрузке, после туннеля. Ставит doctor (через harden_dns) и install.sh.
+clock_unit_ensure(){
+  local want
+  want='[Unit]
+Description=gate: часы малины по цепочке (нет RTC) + оживление DNS
+After=gate-tunnel.service xray.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gate clock sync --boot
+
+[Install]
+WantedBy=multi-user.target'
+  if [ "$(cat "$CLOCK_UNIT" 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" | sudo tee "$CLOCK_UNIT" >/dev/null
+    sudo systemctl daemon-reload
+  fi
+  systemctl is-enabled --quiet gate-clock 2>/dev/null || sudo systemctl enable gate-clock >/dev/null 2>&1
+}
+
+cmd_clock(){
+  case "${1:-status}" in
+    sync)
+      # --boot: туннель на загрузке встаёт не мгновенно — ждём до 2 минут
+      local tries=1; [ "${2:-}" = --boot ] && tries=24
+      clock_sync "$tries"; local rc=$?
+      if self_dns_fix; then echo "DNS малины: ok"; else echo "DNS малины: не отвечает"; rc=1; fi
+      return $rc ;;
+    install) clock_unit_ensure && echo "gate-clock.service установлен и включён" ;;
+    status|"")
+      printf "часы: %s  (NTP %s)\n" "$(date '+%F %T %Z')" "$(clock_synced && echo синхронизирован || echo НЕ синхронизирован)"
+      printf "DNS малины: %s\n" "$(self_dns_ok && echo ok || echo не отвечает)"
+      printf "автопочинка на загрузке: %s\n" "$(systemctl is-enabled --quiet gate-clock 2>/dev/null && echo включена || echo "нет (gate clock install)")" ;;
+    *) echo "gate clock {status|sync|install}" ;;
+  esac
 }
 
 # ─── Команда: doctor ─ проверка+починка (после apt upgrade / ребута) ──
@@ -1150,7 +1236,20 @@ cmd_doctor(){
   printf "%s│%s DNS-утечка: netprobe %s %s\n" "$CYA" "$R" \
     "$(printf '%s' "$np" | grep -q 127.0.0.1 && echo 'на lo' || echo '9.9.9.9 (деф!)')" \
     "$(printf '%s' "$np" | grep -q 127.0.0.1 && ok || bad)"
-  # 6) выход в интернет
+  # 6) часы и DNS самой малины. Раньше доктор их не проверял: при отставших часах все службы
+  # «active», а резолвер мёртв — «наружу: down» без единой красной строки выше.
+  local cline
+  if clock_synced; then cline="$(ok)"
+  else
+    local cmsg=""; [ "$fix" = 1 ] && cmsg="$(clock_sync 1)"
+    # после date -s NTP досинхронизируется не мгновенно — показываем, что сделали
+    if [ -n "$cmsg" ]; then cline="${YEL}$cmsg${R}"; else cline="$(bad) (NTP не синхронизирован)"; fi
+  fi
+  printf "%s│%s часы:   %s\n" "$CYA" "$R" "$cline"
+  local dmsg=""
+  if [ "$fix" = 1 ] && ! self_dns_ok; then self_dns_fix && dmsg=" → перезапустил dnscrypt"; fi
+  printf "%s│%s DNS малины: %s%s\n" "$CYA" "$R" "$(self_dns_ok && ok || bad)" "$dmsg"
+  # 7) выход в интернет
   printf "%s│%s наружу: %s\n" "$CYA" "$R" "$(curl -s --max-time 6 -o /dev/null "$EXIT_CHECK_URL" 2>/dev/null && ok || bad)"
   printf "%s└───────────────────────────────────────────────%s\n\n" "$CYA" "$R"
   if [ "$fix" = 1 ]; then echo "Если «наружу» — down: gate tunnel restart, при апдейте ядра — reboot."; fi
@@ -2635,6 +2734,7 @@ ${hr}━━ ТУННЕЛЬ ━━━━━━━━━━━━━━━━━�
   ${g}gate tunnel up|down|restart${R}  поднять / опустить / пересобрать
   ${g}gate tunnel status${R}           состояние перехвата
   ${g}gate doctor${R}                  проверка+починка (после apt upgrade / ребута)
+  ${g}gate clock${R} [sync]            часы малины (нет RTC) — выставить по цепочке
   ${g}gate freeze [all|risk]${R}       пин версий пакетов (apt-mark hold); ${g}gate unfreeze${R} снять
 
 ${hr}━━ ЦЕПОЧКА (C1/C2/C3) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}
@@ -2693,6 +2793,7 @@ case "${1:-help}" in
   traffic) shift; cmd_traffic "$@" ;;
   tunnel) shift; cmd_tunnel "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
+  clock)  shift; cmd_clock "$@" ;;
   freeze) shift; cmd_freeze "$@" ;;
   unfreeze) cmd_unfreeze ;;
   socks) shift; cmd_socks "$@" ;;

@@ -52,6 +52,8 @@ install_tooling(){
     [ -f "$SELF_DIR/extra/$u.service" ] && install -m 644 "$SELF_DIR/extra/$u.service" "/etc/systemd/system/$u.service"
   done
   systemctl daemon-reload
+  # автопочинка часов на загрузке (у Pi нет RTC) — юнит пишет сам gate, источник один
+  /usr/local/bin/gate clock install >/dev/null 2>&1 || warn "gate-clock.service не установлен"
   ok "утилиты обновлены"
 }
 

@@ -26,7 +26,7 @@ _gate() {
   cur="${COMP_WORDS[COMP_CWORD]}"; cword=$COMP_CWORD
 
   # Полный список команд диспетчера (`case "${1:-help}"` в конце gate)
-  local top="info clients client global lanes traffic tunnel doctor freeze unfreeze
+  local top="info clients client global lanes traffic tunnel doctor clock freeze unfreeze
              socks ovpn pptp profile wipe web exit dns osfp setup chain logs
              wan eth wifi ap version help"
 
@@ -57,6 +57,7 @@ _gate() {
     lanes)  [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "init apply status" -- "$cur") ) ;;
     tunnel) [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "up down restart status" -- "$cur") ) ;;
     doctor) [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "check" -- "$cur") ) ;;
+    clock)  [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "status sync install" -- "$cur") ) ;;
     freeze) [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "all risk status" -- "$cur") ) ;;
     # ── выходы: только НАСТРОЙКА (включение — через gate global) ──────
     socks)  [ "$cword" -eq 2 ] && COMPREPLY=( $(compgen -W "set promote test status" -- "$cur") ) ;;
