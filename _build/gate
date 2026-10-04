@@ -39,6 +39,7 @@ SOCKS_STATE="/etc/gate/socks.state"      # on/off — режим носка (ч�
 SOCKS_CAPS="/etc/gate/socks.caps"        # TCP/RDNS/UDP=ok|fail — возможности носка
 VPN_STATE="/etc/gate/vpn.state"          # on/off — режим VPN-выхода (читает chain-render)
 VPN_META="/etc/gate/vpn.conf"            # TYPE=ovpn|pptp
+OVPN_ACTIVE="/etc/gate/ovpn.active"      # имя профиля ovpn, залитого на C2 (пусто — не из профиля)
 C2_VPN_DIR="/etc/gate/vpn"               # каталог конфигов VPN НА выходном хопе
 PROFILE_DIR="/etc/gate/profiles"         # именованные профили носков/VPN (на малине, root-only)
 VPN_SCRIPT="/usr/local/share/gate/gate-vpn"  # C2-side скрипт (стейджится на малине)
@@ -1841,27 +1842,41 @@ ovpn_set(){
   # глотаются. Префиксуем штатным ignore-unknown-option — строки юзера НЕ трогаем, просто делаем
   # их терпимыми (на Linux эти опции и так бессмысленны). Так чужой .ovpn заводится без правок.
   local winopts="block-outside-dns register-dns dhcp-renew dhcp-release"
-  local found; found="$(grep -hoE "^[[:space:]]*(block-outside-dns|register-dns|dhcp-renew|dhcp-release)" "$f" 2>/dev/null | tr -d '[:space:]' | sort -u | tr '\n' ' ')"
+  # sudo: файл профиля лежит в root-only каталоге (profile use ovpn)
+  local found; found="$(sudo grep -hoE "^[[:space:]]*(block-outside-dns|register-dns|dhcp-renew|dhcp-release)" "$f" 2>/dev/null | tr -d '[:space:]' | sort -u | tr '\n' ' ')"
   local ntmp; ntmp="$(mktemp)" || { echo "  ✗ mktemp не удался"; exit 1; }
-  { printf 'ignore-unknown-option %s\n' "$winopts"; cat "$f"; } > "$ntmp"
+  { printf 'ignore-unknown-option %s\n' "$winopts"; sudo cat "$f"; } > "$ntmp"
   [ -n "$found" ] && echo "  ${YEL}⚠ нормализую Windows-only директивы (на Linux игнорируются):${R} $found"
   push_to_exit "$ntmp" "$C2_VPN_DIR/client.ovpn" && echo "  ✓ конфиг залит" || { echo "  ✗ заливка не удалась"; rm -f "$ntmp"; exit 1; }
   rm -f "$ntmp"
   if [ -n "$u" ]; then
-    s2_exec "umask 077; printf '%s\n%s\n' '$u' '$pw' > $C2_VPN_DIR/auth.txt; echo AUTHOK" >/dev/null
+    # base64, а не '$u' в кавычках: пароль с апострофом закрывал кавычку → выполнялся на C2 от root
+    local cb; cb="$(printf '%s\n%s\n' "$u" "$pw" | base64 -w0)"
+    s2_exec "umask 077; echo $cb | base64 -d > $C2_VPN_DIR/auth.txt; echo AUTHOK" >/dev/null
     echo "  ✓ логин/пароль сохранён на C2"
   else
     s2_exec "rm -f $C2_VPN_DIR/auth.txt" >/dev/null 2>&1
     # Голый `auth-user-pass` без кредов = openvpn на C2 спросит логин/пароль через
     # systemd-ask-password и повиснет навсегда (демон, tty нет). Ловим сразу при set.
-    if grep -qE '^[[:space:]]*auth-user-pass[[:space:]]*$' "$f" 2>/dev/null; then
+    if sudo grep -qE '^[[:space:]]*auth-user-pass[[:space:]]*$' "$f" 2>/dev/null; then
       echo "  ${RED}✗ конфиг требует логин/пароль (auth-user-pass), а они не заданы${R}"
       echo "     ${D}перезалей с кредами:${R} gate ovpn set $f <логин> <пароль>"
-      echo "     ${D}иначе gate ovpn on завершится ошибкой (туннель не встанет)${R}"
+      echo "     ${D}иначе туннель не встанет${R}"
       return 1
     fi
   fi
-  echo "Готово. Включить: gate ovpn on"
+  # какой профиль сейчас на C2 (видит панель); пусто — залит файлом напрямую, не из профиля
+  printf '%s' "${GATE_OVPN_PROFILE:-}" | sudo tee "$OVPN_ACTIVE" >/dev/null
+  # Залитый конфиг сам в живой туннель не попадает — openvpn держит старый. Раньше это
+  # обходилось руками (global ovpn on → global off). Если туннель поднят — перезапускаем
+  # его на новом конфиге, не трогая глобальный выход и полосы.
+  if [ "$(cat "$VPN_STATE" 2>/dev/null)" = on ] && grep -q '^TYPE=ovpn' "$VPN_META" 2>/dev/null; then
+    echo "→ OpenVPN-туннель поднят — перезапускаю на новом конфиге (глобальный выход и полосы не меняю)…"
+    vpn_on ovpn keep >/dev/null || { echo "  ${RED}✗ туннель на новом конфиге не поднялся${R} — подробности: gate ovpn log"; return 1; }
+    echo "  ${GRN}✓${R} туннель на новом конфиге, выход: ${YEL}$(s2_exec "curl -s --interface tun0 --max-time 10 https://api.ipify.org" 2>/dev/null | tr -d '\r')${R}"
+  else
+    echo "Готово. Включить: gate global ovpn on  ${D}(или устройству: gate client <dev> exit vpn)${R}"
+  fi
 }
 # Линтер .ovpn: проверяет конфиг на совместимость с pi_gate (Linux/OpenVPN 2.6 на C2) и
 # даёт рекомендации. Парсер на python в ЭКРАНИРОВАННОМ heredoc (<<'PYEOF') + имя файла через
@@ -1911,8 +1926,12 @@ for opt in ("ca","cert","key","tls-auth","tls-crypt","tls-crypt-v2","pkcs12"):
             "вставь содержимое инлайном: <%s>…</%s> прямо в .ovpn" % (opt, opt))
 
 if has("auth-user-pass"):
-    add("WARN", "сервер требует логин/пароль (auth-user-pass)",
-        "задавай с кредами: gate ovpn set <файл> <user> <pass>")
+    import os
+    if os.environ.get("GATE_OVPN_HAS_CREDS") == "1":   # проверка при загрузке с кредами (панель)
+        add("OK", "сервер требует логин/пароль (auth-user-pass) — заданы")
+    else:
+        add("WARN", "сервер требует логин/пароль (auth-user-pass)",
+            "задавай с кредами: gate ovpn set <файл> <user> <pass>")
 
 comp = [d.split()[0].lower() for d in directives if d.split()[0].lower() in ("comp-lzo","compress")]
 if comp:
@@ -2176,8 +2195,8 @@ cat /tmp/gate-exit-new.json > $EXIT_XRAY_CONF; rm -f /tmp/gate-exit-new.json
 systemctl restart xray && sleep 2 && systemctl is-active xray"
 }
 
-vpn_on(){  # $1 = ovpn|pptp
-  local t="$1"
+vpn_on(){  # $1 = ovpn|pptp   $2 = keep — перезапуск на новом конфиге, глобальный выход не трогаем
+  local t="$1" keep="${2:-}"
   echo "→ Поднимаю VPN-выход ($t) на C2 (xray→vpn-out fwmark, killswitch)…"
   ensure_vpn_script || { echo "  ✗ не удалось обновить gate-vpn на C2"; exit 1; }  # сверка sha256, перезалив лишь при отличии
   # Туннель поднимаем ПЕРВЫМ → tun0/ppp0 + pushed-DNS на C2, и только потом конфиг xray.
@@ -2185,20 +2204,29 @@ vpn_on(){  # $1 = ovpn|pptp
   # без рабочего tun0 → цепочка мертва, хотя прямой выход C2 был исправен.
   if ! s2_exec "echo $t > $C2_VPN_DIR/type
 gate-vpn up"; then
-    echo "  ${RED}✗ туннель ($t) не поднялся${R} — выход остаётся ${GRN}прямым (C2)${R}, цепочка цела"
+    if [ "$keep" = keep ]; then
+      # gate-vpn up уже снял старый туннель — полосы на VPN по fail-closed в blackhole
+      echo "  ${RED}✗ туннель на новом конфиге не поднялся${R} — устройства на VPN-полосе заблокированы"
+      echo "     ${D}(fail-closed, мимо VPN не утекают); остальные не затронуты. Верни рабочий профиль.${R}"
+    else
+      echo "  ${RED}✗ туннель ($t) не поднялся${R} — выход остаётся ${GRN}прямым (C2)${R}, цепочка цела"
+    fi
     echo "     ${D}подробности: gate ovpn log   ·   проверить конфиг: gate ovpn check <файл.ovpn>${R}"
     return 1
   fi
   # Флаги ставим ДО сборки: exit_apply читает состояние из файлов.
   echo on | sudo tee "$VPN_STATE" >/dev/null
   echo "TYPE=$t" | sudo tee "$VPN_META" >/dev/null
-  sudo bash -c "printf 'GLOBAL=%s\nGLOBAL_SOCKS=\n' '$t' > $GLOBAL_EXIT"
-  # носок больше не глобальный выход → снимаем его флаг, иначе статус и exit_apply
-  # видят два «включённых» выхода сразу (каналы socks:<профиль> от этого не зависят)
-  echo off | sudo tee "$SOCKS_STATE" >/dev/null
+  if [ "$keep" != keep ]; then
+    sudo bash -c "printf 'GLOBAL=%s\nGLOBAL_SOCKS=\n' '$t' > $GLOBAL_EXIT"
+    # носок больше не глобальный выход → снимаем его флаг, иначе статус и exit_apply
+    # видят два «включённых» выхода сразу (каналы socks:<профиль> от этого не зависят)
+    echo off | sudo tee "$SOCKS_STATE" >/dev/null
+  fi
   if ! exit_apply; then
     echo "  ${RED}✗ конфиг выхода на C2 не применился${R} — снимаю туннель, возврат на прямой C2"
-    sudo bash -c "printf 'GLOBAL=c2\nGLOBAL_SOCKS=\n' > $GLOBAL_EXIT"
+    # vpn_off сам вернёт глобальный на C2, только если глобальным был туннель (keep — не был)
+    [ "$keep" = keep ] || sudo bash -c "printf 'GLOBAL=c2\nGLOBAL_SOCKS=\n' > $GLOBAL_EXIT"
     vpn_off >/dev/null 2>&1
     return 1
   fi
@@ -2471,7 +2499,12 @@ profile_list(){
         *)    n="$(sudo ls -1 "$d" 2>/dev/null | sed 's/\.conf$//')";;
       esac
     fi
-    if [ -n "$n" ]; then echo "$n" | sed 's/^/  /'; else echo "  ${D}(пусто)${R}"; fi
+    if [ -n "$n" ]; then
+      local act=""; [ "$t" = ovpn ] && act="$(sudo cat "$OVPN_ACTIVE" 2>/dev/null)"
+      echo "$n" | while IFS= read -r x; do
+        if [ -n "$act" ] && [ "$x" = "$act" ]; then echo "  $x  ${GRN}← на C2${R}"; else echo "  $x"; fi
+      done
+    else echo "  ${D}(пусто)${R}"; fi
   done
 }
 
@@ -2504,11 +2537,14 @@ EOF"
       ;;
     ovpn)
       local f="${1:-}" user="${2:-}" pass="${3:-}"
-      [ -f "$f" ] || { echo "Файл не найден: $f  (укажи путь к .ovpn на малине)"; exit 1; }
+      sudo test -f "$f" || { echo "Файл не найден: $f  (укажи путь к .ovpn на малине)"; exit 1; }
       sudo mkdir -p "$PROFILE_DIR/ovpn/$name"
-      sudo bash -c "umask 077; cat '$f' > '$PROFILE_DIR/ovpn/$name/client.ovpn'"
+      # Через stdin, а не '$user' внутри `sudo bash -c "…"`: логин/пароль с апострофом или
+      # $(…) выполнялись бы от root (панель зовёт gate от root — это граница привилегий).
+      local wr='umask 077; cat > "$1"'
+      sudo cat "$f" | sudo sh -c "$wr" sh "$PROFILE_DIR/ovpn/$name/client.ovpn"
       if [ -n "$user" ]; then
-        sudo bash -c "umask 077; printf '%s\n%s\n' '$user' '$pass' > '$PROFILE_DIR/ovpn/$name/auth.txt'"
+        printf '%s\n%s\n' "$user" "$pass" | sudo sh -c "$wr" sh "$PROFILE_DIR/ovpn/$name/auth.txt"
       else
         sudo rm -f "$PROFILE_DIR/ovpn/$name/auth.txt"
       fi
@@ -2544,7 +2580,7 @@ profile_use(){
       if sudo test -f "$d/auth.txt"; then
         u="$(sudo sed -n 1p "$d/auth.txt")"; pw="$(sudo sed -n 2p "$d/auth.txt")"
       fi
-      ovpn_set "$d/client.ovpn" "$u" "$pw"
+      GATE_OVPN_PROFILE="$name" ovpn_set "$d/client.ovpn" "$u" "$pw"
       ;;
     *) echo "gate profile use <socks|pptp|ovpn> <имя>"; exit 1 ;;
   esac
@@ -2556,7 +2592,9 @@ profile_rm(){
   case "$t" in
     socks) sudo rm -f  "$PROFILE_DIR/socks/$name.conf" ;;
     pptp)  sudo rm -f  "$PROFILE_DIR/pptp/$name.conf" ;;
-    ovpn)  sudo rm -rf "$PROFILE_DIR/ovpn/$name" ;;
+    ovpn)  sudo rm -rf "$PROFILE_DIR/ovpn/$name"
+           # удалили тот, что сейчас на C2 → метку снимаем (сам туннель работает дальше)
+           [ "$(sudo cat "$OVPN_ACTIVE" 2>/dev/null)" = "$name" ] && sudo truncate -s0 "$OVPN_ACTIVE" ;;
     *) echo "gate profile rm <socks|pptp|ovpn> <имя>"; exit 1 ;;
   esac
   echo "Профиль $t/$name удалён."

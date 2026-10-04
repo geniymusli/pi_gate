@@ -19,7 +19,7 @@
 # Запуск:  gate-web.py serve            (systemd-юнит gate-web.service)
 # Пароль:  gate-web.py passwd [пароль]  (или пароль из stdin)
 #
-import os, sys, json, hmac, hashlib, base64, secrets, subprocess, time, ipaddress, re
+import os, sys, json, hmac, hashlib, base64, secrets, subprocess, time, ipaddress, re, tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF        = "/etc/gate/web.conf"
@@ -32,6 +32,58 @@ PBKDF2_ITERS= 200_000
 ANSI_RE     = re.compile(r"\x1b\[[0-9;]*m")
 NAME_RE     = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 PTYPES      = ("socks", "pptp", "ovpn")
+# Логин/пароль уходят в argv gate, а тот местами пишет их через shell и читает профили
+# через eval (носки, PPTP). Панель — граница привилегий (gate бежит от root), поэтому
+# на входе пускаем только безопасный для shell набор: без пробелов, кавычек, $, `, \.
+CRED_RE     = re.compile(r"^[A-Za-z0-9!#%&()*+,./:;<=>?@^_{|}~\[\]-]{0,128}$")
+CRED_HELP   = "логин/пароль: латиница, цифры и !#%&()*+,./:;<=>?@^_{|}~[]- (без пробелов, кавычек, $, `, \\)"
+MAX_BODY    = 256 * 1024        # потолок тела POST: .ovpn ~8 КБ, остальное — крошечный JSON
+OVPN_MAX    = 128 * 1024
+PROF_DIR    = "/etc/gate/profiles"
+OVPN_ACTIVE = "/etc/gate/ovpn.active"
+# gate-vpn поднимает openvpn с --script-security 2 (нужно для нашего up-хука). Значит любая
+# из этих директив в загруженном .ovpn выполнила бы произвольную команду ОТ ROOT НА C2.
+# Наш --up идёт в командной строке после --config и перекрывает `up` из файла, но остальные
+# хуки — нет. Комментарии (# ;) не в счёт: в ASUS-конфигах лежит «#script-security 2».
+OVPN_DENY   = ("up", "down", "route-up", "route-pre-down", "ipchange", "tls-verify",
+               "learn-address", "client-connect", "client-disconnect", "auth-user-pass-verify",
+               "plugin", "script-security", "config", "management", "tls-export-cert", "setenv",
+               "setenv-safe", "dev-node", "writepid", "log", "log-append", "status", "cd", "chroot")
+
+
+def ovpn_problem(text):
+    """None, если .ovpn можно принять; иначе — причина отказа."""
+    if not isinstance(text, str) or not text.strip():
+        return "пустой файл"
+    if len(text) > OVPN_MAX:
+        return "файл больше 128 КБ — это не .ovpn"
+    if "\x00" in text:
+        return "бинарный файл — это не .ovpn"
+    has_remote = has_client = False
+    block = None                    # внутри <ca>…</ca> и т.п. — сертификаты, не директивы
+    for ln in text.splitlines():
+        s = ln.strip()
+        if block:
+            if s.lower() == "</%s>" % block:
+                block = None
+            continue
+        m = re.match(r"^<([A-Za-z][A-Za-z0-9-]*)>$", s)
+        if m:
+            block = m.group(1).lower()
+            continue
+        f = s.split()
+        if not f or f[0].startswith(("#", ";")):
+            continue
+        d = f[0].lstrip("-").lower()
+        if d in OVPN_DENY:
+            return "директива «%s» запрещена: выполняет команды/пишет файлы на C2 от root" % d
+        has_remote |= d == "remote"
+        has_client |= d in ("client", "tls-client", "pull")
+    if not has_remote:
+        return "нет директивы remote — это не клиентский конфиг OpenVPN"
+    if not has_client:
+        return "нет директивы client — это не клиентский конфиг OpenVPN"
+    return None
 
 # AP-подсеть берём из gate.conf, если переопределена; иначе дефолт.
 AP_SUBNET = "192.168.50.0/24"
@@ -236,8 +288,8 @@ def build_argv(action, p):
             raise ValueError("bad name/ip")
         if not port.isdigit() or not (0 < int(port) < 65536):
             raise ValueError("bad port")
-        if any(c in (user + pw) for c in "\r\n"):
-            raise ValueError("bad creds")
+        if not (CRED_RE.match(user) and CRED_RE.match(pw)):
+            raise ValueError(CRED_HELP)
         argv = ["profile", "save", "socks", n, ip, port]
         if user or pw:
             argv += [user, pw]
@@ -252,8 +304,8 @@ def build_argv(action, p):
             raise ValueError("bad server")
         if not user or not pw:
             raise ValueError("need user+pass")
-        if any(c in (user + pw) for c in "\r\n"):
-            raise ValueError("bad creds")
+        if not (CRED_RE.match(user) and CRED_RE.match(pw)):
+            raise ValueError(CRED_HELP)
         return ["profile", "save", "pptp", n, srv, user, pw]
 
     raise ValueError("unknown action: %s" % action)
@@ -263,8 +315,9 @@ def strip_ansi(s):
     return ANSI_RE.sub("", s or "")
 
 
-def run_gate(argv, timeout=120):
+def run_gate(argv, timeout=120, env_extra=None):
     env = dict(os.environ)
+    env.update(env_extra or {})
     env["TERM"] = "dumb"
     env["NO_COLOR"] = "1"
     try:
@@ -287,8 +340,51 @@ def parse_profiles():
         if s.endswith(":") and s[:-1] in PTYPES:
             cur = s[:-1]
         elif cur and s and s != "(пусто)":
-            res[cur].append(s)
+            res[cur].append(s.split()[0])     # ovpn-строка бывает «имя  ← на C2»
     return res
+
+
+def read_ovpn():
+    """OpenVPN-профили для морды: имя, сервер, протокол, есть ли креды, какой сейчас на C2.
+    Читаем каталог напрямую (морда бежит root'ом), а не парсим вывод CLI."""
+    base = os.path.join(PROF_DIR, "ovpn")
+    try:
+        active = open(OVPN_ACTIVE).read().strip()
+    except OSError:
+        active = ""
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        names = []
+    out = []
+    for n in names:
+        d = os.path.join(base, n)
+        cfg = os.path.join(d, "client.ovpn")
+        if not NAME_RE.match(n) or not os.path.isfile(cfg):
+            continue
+        remotes, proto = [], ""
+        try:
+            for ln in open(cfg, errors="replace"):
+                f = ln.split()
+                if not f or f[0].startswith(("#", ";")):
+                    continue
+                if f[0] == "remote" and len(f) >= 2:
+                    remotes.append((f[1], f[2] if len(f) > 2 else ""))
+                elif f[0] == "proto" and len(f) >= 2 and not proto:
+                    proto = f[1].replace("-client", "")
+        except OSError:
+            pass
+        # у ASUS первым идёт длинное DDNS-имя, вторым — IP; IP читабельнее
+        host, port = next((r for r in remotes if valid_ip(r[0])), remotes[0] if remotes else ("", ""))
+        out.append({"name": n, "remote": host + (":" + port if port else ""), "proto": proto,
+                    "auth": os.path.isfile(os.path.join(d, "auth.txt")), "active": n == active})
+    def rd(pth):
+        try:
+            return open(pth).read().strip()
+        except OSError:
+            return ""
+    tunnel = rd("/etc/gate/vpn.state") == "on" and "TYPE=ovpn" in rd("/etc/gate/vpn.conf")
+    return {"profiles": out, "tunnel": tunnel}
 
 
 def read_state():
@@ -500,6 +596,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"code": code, "out": out})
         if path == "/api/profiles":
             return self._json(200, parse_profiles())
+        if path == "/api/ovpn":
+            return self._json(200, read_ovpn())
         if path == "/api/state":
             return self._json(200, read_state())
         if path == "/api/devices":
@@ -510,7 +608,12 @@ class Handler(BaseHTTPRequestHandler):
         if not src_ok(self._client_ip()):
             return self._send(403, "forbidden", "text/plain; charset=utf-8")
         path = self.path.split("?", 1)[0]
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            return self._json(413, {"error": "слишком большой запрос"})
         raw = self.rfile.read(length) if length else b""
 
         if path == "/login":
@@ -540,8 +643,49 @@ class Handler(BaseHTTPRequestHandler):
                 argv = build_argv(action, body)
             except (ValueError, json.JSONDecodeError) as e:
                 return self._json(400, {"error": str(e)})
-            code, out = run_gate(argv)
+            # «сделать активным» для ovpn перезапускает туннель на C2 — это до минуты
+            code, out = run_gate(argv, timeout=300 if argv[:3] == ["profile", "use", "ovpn"] else 120)
             return self._json(200, {"code": code, "out": out})
+
+        if path == "/api/ovpn_upload":
+            if not self._authed():
+                return self._json(401, {"error": "auth"})
+            if self.headers.get("X-Gate") != "1":
+                return self._json(403, {"error": "csrf"})
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._json(400, {"error": "bad json"})
+            name, content = body.get("name", ""), body.get("content", "")
+            user, pw = body.get("user", ""), body.get("pass", "")
+            if not isinstance(name, str) or not NAME_RE.match(name):
+                return self._json(400, {"error": "имя: латиница, цифры, . _ - (до 64)"})
+            if not (isinstance(user, str) and isinstance(pw, str)
+                    and CRED_RE.match(user) and CRED_RE.match(pw)):
+                return self._json(400, {"error": CRED_HELP})
+            if pw and not user:
+                return self._json(400, {"error": "пароль без логина"})
+            bad = ovpn_problem(content)
+            if bad:
+                return self._json(400, {"error": bad})
+            fd, tmp = tempfile.mkstemp(prefix="gate-ovpn-", suffix=".ovpn")   # 0600, root
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(content)
+                _, lint = run_gate(["ovpn", "check", tmp],
+                                   env_extra={"GATE_OVPN_HAS_CREDS": "1" if user else ""})
+                argv = ["profile", "save", "ovpn", name, tmp] + ([user, pw] if user else [])
+                code, out = run_gate(argv)
+                outs = [lint.strip(), out.strip()]
+                if code == 0 and body.get("apply"):
+                    code, o2 = run_gate(["profile", "use", "ovpn", name], timeout=300)
+                    outs.append(o2.strip())
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return self._json(200, {"code": code, "out": "\n\n".join(x for x in outs if x)})
 
         return self._send(404, "not found", "text/plain; charset=utf-8")
 
@@ -685,6 +829,23 @@ body.busy{cursor:progress}
 </div>
 
 <div class=card>
+  <h2>OpenVPN-конфиги <span class=badge>туннель: <span id=ovtun>…</span></span></h2>
+  <div id=ovlist class=plist><span class=muted>загрузка…</span></div>
+  <div class=row style="margin-top:10px">
+    <span class=lbl>+ .ovpn:</span>
+    <input type=file id=ovfile accept=".ovpn,.conf" onchange="ovPick()">
+    <input id=ovname placeholder=имя size=10>
+    <input id=ovuser placeholder="логин (если нужен)" size=12 autocomplete=off>
+    <input id=ovpass placeholder=пароль size=10 type=password autocomplete=new-password>
+    <label class=muted><input type=checkbox id=ovapply> сразу сделать активным</label>
+    <button class=go onclick="uploadOvpn()">загрузить</button>
+  </div>
+  <p class=muted>На C2 один OpenVPN — активен ровно один конфиг. «Сделать активным» заливает его на C2;
+  если туннель поднят, перезапускает его на новом конфиге (глобальный выход и полосы не меняются).
+  Директивы, исполняющие команды на C2 (down, route-up, plugin, script-security…), отвергаются.</p>
+</div>
+
+<div class=card>
   <h2>Профили</h2>
   <div id=profiles class=plist><span class=muted>загрузка…</span></div>
   <div class=row style="margin-top:10px">
@@ -704,7 +865,6 @@ body.busy{cursor:progress}
     <input id=qpw placeholder=pass size=10>
     <button class=go onclick="savePptp()">сохранить</button>
   </div>
-  <p class=muted>OpenVPN-профиль добавляется через CLI: <code>gate profile save ovpn &lt;имя&gt; &lt;файл.ovpn&gt;</code> (нужна загрузка файла).</p>
 </div>
 
 <div class=card>
@@ -811,7 +971,7 @@ async function setName(mac,name){
 async function setDev(mac,target){
   var d=await run({action:'client_exit',mac:mac,target:target||'auto'},'назначаю выход');
   if(d)refresh()}
-async function refresh(){loadInfo();loadState();loadProfiles();loadDevs()}
+async function refresh(){loadInfo();loadState();loadProfiles();loadOvpn();loadDevs()}
 // Пока команда идёт (а `doctor`/`socks test` лезут на C2 через цепочку и это небыстро),
 // блокируем управление и подводим к выводу — иначе кажется, что кнопка не сработала.
 function uiBusy(on){
@@ -833,7 +993,7 @@ async function act(action,extra){
 async function loadProfiles(){var d=await api('/api/profiles');if(!d)return;
   var box=document.getElementById('profiles');box.innerHTML='';
   var any=false;
-  ['socks','pptp','ovpn'].forEach(function(t){(d[t]||[]).forEach(function(n){any=true;
+  ['socks','pptp'].forEach(function(t){(d[t]||[]).forEach(function(n){any=true;
     var el=document.createElement('div');el.className='pitem';
     el.innerHTML='<span class=muted>'+t+'</span><b></b>';
     el.querySelector('b').textContent=n;
@@ -843,6 +1003,42 @@ async function loadProfiles(){var d=await api('/api/profiles');if(!d)return;
     rm.onclick=function(){if(confirm('Удалить профиль '+t+'/'+n+'?'))act('profile_rm',{ptype:t,name:n})};
     el.appendChild(use);el.appendChild(rm);box.appendChild(el)})});
   if(!any)box.innerHTML='<span class=muted>профилей нет — добавь носок ниже или через CLI</span>'}
+// ── OpenVPN-конфиги ──
+async function loadOvpn(){var d=await api('/api/ovpn');if(!d)return;
+  document.getElementById('ovtun').textContent=d.tunnel?'поднят':'не поднят';
+  var box=document.getElementById('ovlist');box.innerHTML='';
+  if(!d.profiles.length){box.innerHTML='<span class=muted>конфигов нет — загрузи .ovpn ниже</span>';return}
+  d.profiles.forEach(function(p){
+    var el=document.createElement('div');el.className='pitem';
+    var b=document.createElement('b');b.textContent=p.name;
+    var m=document.createElement('span');m.className='muted';
+    m.textContent=(p.remote||'?')+(p.proto?' · '+p.proto:'')+(p.auth?' · с логином':'');
+    el.appendChild(b);el.appendChild(m);
+    if(p.active){var a=document.createElement('span');a.className='badge';a.textContent='активен (на C2)';el.appendChild(a)}
+    var use=document.createElement('button');use.className='on';use.textContent=p.active?'перезалить':'сделать активным';
+    use.onclick=function(){act('profile_use',{ptype:'ovpn',name:p.name})};
+    var rm=document.createElement('button');rm.className='off';rm.textContent='✕';
+    rm.onclick=function(){if(confirm('Удалить конфиг «'+p.name+'»?'+(p.active?'\nОн сейчас на C2: туннель продолжит работать, но профиля не останется.':'')))
+      act('profile_rm',{ptype:'ovpn',name:p.name})};
+    el.appendChild(use);el.appendChild(rm);box.appendChild(el)})}
+function ovNameFromFile(f){return f.replace(/\.(ovpn|conf)$/i,'').replace(/[^A-Za-z0-9._-]+/g,'_').replace(/^_+|_+$/g,'').slice(0,32)}
+function ovPick(){var fi=document.getElementById('ovfile'),n=document.getElementById('ovname');
+  if(fi.files&&fi.files[0]&&!n.value.trim())n.value=ovNameFromFile(fi.files[0].name)}
+async function uploadOvpn(){
+  var fi=document.getElementById('ovfile');var f=fi.files&&fi.files[0];
+  if(!f){setOut('выбери .ovpn-файл');return}
+  if(f.size>131072){setOut('файл больше 128 КБ — это не .ovpn');return}
+  var name=gv('ovname')||ovNameFromFile(f.name);
+  var body={name:name,content:await f.text(),user:gv('ovuser'),
+            pass:document.getElementById('ovpass').value,apply:document.getElementById('ovapply').checked};
+  setOut('… загружаю «'+name+'»'+(body.apply?' и делаю активным — туннель перезапускается, до минуты':''),true);
+  uiBusy(true);showOut();
+  var d=null;try{d=await api('/api/ovpn_upload',{method:'POST',body:JSON.stringify(body)})}finally{uiBusy(false)}
+  if(!d)return;
+  if(d.error){setOut('ошибка: '+d.error);return}
+  setOut(d.out||('код '+d.code));
+  fi.value='';['ovname','ovuser','ovpass'].forEach(function(id){document.getElementById(id).value=''});
+  document.getElementById('ovapply').checked=false;refresh()}
 function gv(id){return document.getElementById(id).value.trim()}
 function saveSocks(){var b={name:gv('pn'),ip:gv('pip'),port:gv('pp'),user:gv('pu'),pass:gv('ppw')};
   if(!b.name||!b.ip||!b.port){setOut('нужны имя, ip и порт');return}
